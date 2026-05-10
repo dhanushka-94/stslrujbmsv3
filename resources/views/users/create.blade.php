@@ -53,8 +53,8 @@
         </div>
         @if(count($sourceCategories ?? []) > 0)
         <div>
-            <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Allowed categories (for Editor role)</label>
-            <p class="text-xs text-slate-500 dark:text-slate-400 mb-2">When role is Editor: only job items in selected categories can be edited. Leave all unchecked = can edit any category.</p>
+            <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Allowed categories (editor / framing roles)</label>
+            <p class="text-xs text-slate-500 dark:text-slate-400 mb-2">When the role includes editing or framing: only job items in selected categories apply. Leave all unchecked = any category.</p>
             <div class="space-y-2 max-h-48 overflow-y-auto rounded border border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] p-3 bg-slate-50 dark:bg-slate-800/50">
                 @foreach(($sourceCategories ?? []) as $cat)
                     <label class="flex items-center gap-2 cursor-pointer">

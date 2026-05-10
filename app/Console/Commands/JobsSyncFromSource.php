@@ -4,6 +4,7 @@ namespace App\Console\Commands;
 
 use App\Models\Job;
 use App\Models\JobEdit;
+use App\Services\SaleItemsJobEditsBuilder;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 
@@ -17,7 +18,7 @@ class JobsSyncFromSource extends Command
     private const SOURCE_CONNECTION = 'source';
 
     /** payment_status values that mean job is active (unpaid/pending) */
-    private const ACTIVE_PAYMENT_STATUSES = ['pending', 'due', 'partial'];
+    private const ACTIVE_PAYMENT_STATUSES = ['pending', 'due', 'partial', 'unpaid'];
 
     public function handle(): int
     {
@@ -98,49 +99,16 @@ class JobsSyncFromSource extends Command
             return;
         }
 
-        $rows = [];
-        foreach ($items as $i => $item) {
-            $name = trim((string) ($item->product_name ?? ''));
-            if ($name === '') {
-                $name = 'Item ' . ($i + 1);
-            }
-            $productId = isset($item->product_id) ? (int) $item->product_id : null;
-            $categoryName = null;
-            $subcategoryName = null;
-            $sourceCategoryId = null;
-            if ($productId > 0) {
-                $product = DB::connection($conn)->table('sma_products')->where('id', $productId)->first(['id', 'category_id', 'subcategory_id']);
-                if ($product) {
-                    $catId = (int) ($product->category_id ?? 0);
-                    if ($catId > 0) {
-                        $sourceCategoryId = $catId;
-                        $cat = DB::connection($conn)->table('sma_categories')->where('id', $catId)->value('name');
-                        $categoryName = $cat;
-                    }
-                    $subId = (int) ($product->subcategory_id ?? 0);
-                    if ($subId > 0) {
-                        $sub = DB::connection($conn)->table('sma_categories')->where('id', $subId)->value('name');
-                        $subcategoryName = $sub;
-                    }
-                }
-            }
-            $rows[] = [
-                'name' => $name,
-                'source_product_id' => $productId ?: null,
-                'category_name' => $categoryName,
-                'subcategory_name' => $subcategoryName,
-                'source_category_id' => $sourceCategoryId,
-            ];
-        }
+        $rows = SaleItemsJobEditsBuilder::rowsFromSaleItems($conn, $items);
 
         if (empty($rows)) {
             if ($job->edits()->count() === 0) {
-                $job->edits()->create([
+                $job->edits()->create(JobEdit::attributesForExistingColumns([
                     'name' => 'Edit 1',
                     'sort_order' => 0,
                     'edit_status' => JobEdit::EDIT_STATUS_PENDING,
                     'print_status' => JobEdit::PRINT_STATUS_PENDING,
-                ]);
+                ]));
             }
             return;
         }
@@ -148,16 +116,19 @@ class JobsSyncFromSource extends Command
         $existing = $job->edits()->orderBy('sort_order')->get();
         foreach ($rows as $sortOrder => $row) {
             $edit = $existing->firstWhere('sort_order', $sortOrder);
-            $payload = [
+            $payload = JobEdit::attributesForExistingColumns([
                 'name' => $row['name'],
                 'source_product_id' => $row['source_product_id'],
                 'category_name' => $row['category_name'],
                 'subcategory_name' => $row['subcategory_name'],
                 'source_category_id' => $row['source_category_id'] ?? null,
+                'source_sale_item_id' => $row['source_sale_item_id'] ?? null,
+                'source_quantity_unit_index' => $row['source_quantity_unit_index'] ?? null,
+                'source_quantity_unit_total' => $row['source_quantity_unit_total'] ?? null,
                 'sort_order' => $sortOrder,
                 'edit_status' => $edit ? $edit->edit_status : JobEdit::EDIT_STATUS_PENDING,
                 'print_status' => $edit ? $edit->print_status : JobEdit::PRINT_STATUS_PENDING,
-            ];
+            ]);
             if ($edit) {
                 $edit->update($payload);
             } else {

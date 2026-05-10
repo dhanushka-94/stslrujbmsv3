@@ -39,7 +39,18 @@ class DashboardController extends Controller
             $myCompletedCount = Job::where(function ($q) use ($user) {
                 $q->where('assigned_editor_id', $user->id)->orWhereHas('editors', fn ($q) => $q->where('user_id', $user->id));
             })->whereIn('status', [Job::STATUS_COMPLETED, Job::STATUS_DELIVERED])->count();
-            return view('dashboard.editor', compact('myJobs', 'availableCount', 'myCompletedCount'));
+            $framingDashboard = false;
+
+            return view('dashboard.editor', compact('myJobs', 'availableCount', 'myCompletedCount', 'framingDashboard'));
+        }
+
+        if ($user->isFraming() && ! $user->isEditor()) {
+            $myJobs = collect();
+            $availableCount = 0;
+            $myCompletedCount = 0;
+            $framingDashboard = true;
+
+            return view('dashboard.editor', compact('myJobs', 'availableCount', 'myCompletedCount', 'framingDashboard'));
         }
 
         if ($user->isPrinter()) {

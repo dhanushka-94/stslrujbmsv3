@@ -10,21 +10,24 @@
     @vite(['resources/css/app.css', 'resources/js/app.js'])
 </head>
 <body class="bg-[var(--color-studio-bg)] min-h-screen text-slate-800 dark:text-slate-100 flex flex-col">
-    {{-- Mini header: logo + app name (left), live date & time (right) - full width --}}
-    <header class="bg-slate-100 dark:bg-slate-800/80 border-b border-slate-200 dark:border-slate-700">
-        <div class="w-full max-w-none px-4 sm:px-6 lg:px-8 py-1.5 flex items-center justify-between">
-            <a href="{{ route('dashboard') }}" class="inline-flex items-center gap-2 font-semibold text-[var(--color-studio-primary)] dark:text-[var(--color-studio-accent)]">
-                <img src="{{ asset('studio_salaru_logo.jpg') }}" alt="{{ config('app.name') }}" class="h-7 w-auto object-contain" />
-                <span class="text-sm sm:text-base">{{ config('app.name') }}</span>
-            </a>
-            <span id="live-datetime" class="text-xs font-medium text-slate-600 dark:text-slate-400 tabular-nums" aria-live="polite">
-                {{ now()->format('l, F j, Y') }} &nbsp; {{ now()->format('h:i:s A') }}
-            </span>
-        </div>
-    </header>
-    {{-- Main menu: full-width nav with ordered items and grouped Settings submenu --}}
-    <nav class="relative z-30 border-b border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] bg-[var(--color-studio-bg-card)]/95 dark:bg-[var(--color-studio-dark-card)]/95 backdrop-blur-sm shadow-sm">
-        <div class="w-full max-w-none px-4 sm:px-6 lg:px-8 py-2 flex items-center justify-between gap-2 sm:gap-4">
+    {{-- Sticky site header: brand strip + main nav (stays visible while scrolling) --}}
+    <div class="sticky top-0 z-40 border-b border-slate-200/90 bg-[var(--color-studio-bg)]/85 shadow-[0_8px_30px_-12px_rgba(15,23,42,0.12)] backdrop-blur-md dark:border-slate-700/80 dark:bg-slate-950/80 dark:shadow-[0_12px_40px_-16px_rgba(0,0,0,0.45)]">
+        <header class="border-b border-slate-200/70 bg-gradient-to-r from-white/90 via-slate-50/80 to-white/90 dark:border-slate-700/60 dark:from-slate-900/90 dark:via-slate-900/70 dark:to-slate-900/90">
+            <div class="mx-auto flex w-full max-w-none items-center justify-between gap-3 px-4 py-2 sm:px-6 lg:px-8">
+                <a href="{{ route('dashboard') }}" class="inline-flex min-w-0 items-center gap-2.5 rounded-lg py-0.5 font-semibold text-[var(--color-studio-primary)] ring-[var(--color-studio-primary)]/15 transition hover:opacity-90 focus:outline-none focus-visible:ring-2 dark:text-[var(--color-studio-accent)] dark:ring-[var(--color-studio-accent)]/20">
+                    <span class="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white shadow-sm ring-1 ring-slate-200/80 dark:bg-slate-800 dark:ring-slate-600">
+                        <img src="{{ asset('studio_salaru_logo.jpg') }}" alt="{{ config('app.name') }}" class="h-7 w-auto max-h-full max-w-full object-contain" />
+                    </span>
+                    <span class="truncate text-sm sm:text-base">{{ config('app.name') }}</span>
+                </a>
+                <span id="live-datetime" class="inline-flex max-w-[min(100%,18rem)] items-center rounded-full border border-slate-200/90 bg-white/90 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-600 shadow-sm tabular-nums dark:border-slate-600 dark:bg-slate-800/90 dark:text-slate-300 sm:max-w-none sm:text-xs sm:normal-case sm:tracking-normal" aria-live="polite">
+                    {{ now()->format('l, F j, Y') }} &nbsp; {{ now()->format('h:i:s A') }}
+                </span>
+            </div>
+        </header>
+        {{-- Main menu: full-width nav with ordered items and grouped Settings submenu --}}
+        <nav class="relative bg-[var(--color-studio-bg-card)]/92 dark:bg-[var(--color-studio-dark-card)]/92">
+            <div class="mx-auto flex w-full max-w-none items-center justify-between gap-2 px-4 py-2.5 sm:gap-4 sm:px-6 lg:px-8">
             @auth
                 <div class="flex flex-wrap items-center gap-1.5 min-w-0 flex-1">
                     <a href="{{ route('dashboard') }}" class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded-full whitespace-nowrap transition-colors
@@ -38,9 +41,15 @@
                         Jobs
                     </a>
                     <a href="{{ route('jobs.live') }}" class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded-full whitespace-nowrap transition-colors
-                        {{ request()->routeIs('jobs.live') ? 'bg-[var(--color-studio-primary)] text-white shadow-sm' : 'text-slate-600 dark:text-slate-400 hover:text-[var(--color-studio-primary)] hover:bg-slate-100 dark:hover:bg-slate-700' }}">
+                        {{ request()->routeIs('jobs.live') ? 'bg-[var(--color-studio-primary)] text-white shadow-sm' : 'text-slate-600 dark:text-slate-400 hover:text-[var(--color-studio-primary)] hover:bg-slate-100 dark:hover:bg-slate-700' }}"
+                        @if(filled($jobPoolNotifyTitle ?? null)) title="{{ $jobPoolNotifyTitle }}" @endif>
                         @include('components.icons', ['name' => 'bolt', 'class' => 'w-4 h-4'])
                         Job Pool
+                        @if(isset($jobPoolNewCount) && $jobPoolNewCount > 0)
+                            <span class="ml-1 inline-flex items-center justify-center rounded-full bg-red-600 text-white text-[10px] min-w-[16px] h-4 px-1" aria-label="{{ $jobPoolNotifyTitle ?? 'New Job Pool items' }}">
+                                {{ $jobPoolNewCount > 9 ? '9+' : $jobPoolNewCount }}
+                            </span>
+                        @endif
                     </a>
                     <a href="{{ route('profile.show') }}" class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded-full whitespace-nowrap transition-colors
                         {{ request()->routeIs('profile.*') ? 'bg-[var(--color-studio-primary)]/10 text-[var(--color-studio-primary)] dark:bg-[var(--color-studio-accent)]/10 dark:text-[var(--color-studio-accent)]' : 'text-slate-600 dark:text-slate-400 hover:text-[var(--color-studio-primary)] hover:bg-slate-100 dark:hover:bg-slate-700' }}">
@@ -69,6 +78,10 @@
                                 <a href="{{ route('source-categories.index') }}" class="flex items-center gap-2 px-3 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700" role="menuitem">
                                     @include('components.icons', ['name' => 'folder', 'class' => 'w-4 h-4 text-slate-500'])
                                     Categories
+                                </a>
+                                <a href="{{ route('settings.pos-sales') }}" class="flex items-center gap-2 px-3 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700" role="menuitem">
+                                    @include('components.icons', ['name' => 'briefcase', 'class' => 'w-4 h-4 text-slate-500'])
+                                    POS sales
                                 </a>
                                 <div class="border-t border-slate-200 dark:border-slate-600 my-1"></div>
                                 <div class="px-3 py-1.5 text-xs font-semibold text-slate-400 dark:text-slate-500 uppercase tracking-wider">Visibility</div>
@@ -103,16 +116,18 @@
                     </div>
                     <form action="{{ route('logout') }}" method="POST" class="inline">
                         @csrf
-                        <button type="submit" class="text-sm px-3 py-1.5 rounded-full border border-[var(--color-studio-border)] hover:bg-slate-100 dark:hover:bg-slate-700">
-                            Logout
+                        <button type="submit" class="rounded-full border border-slate-300/90 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-studio-primary)]/30 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700">
+                            Log out
                         </button>
                     </form>
                 </div>
             @endauth
-        </div>
-    </nav>
+            </div>
+        </nav>
+    </div>
 
-    <main class="w-full max-w-none px-4 sm:px-6 lg:px-8 py-4 sm:py-6 flex-1 min-w-0">
+    {{-- pb: clears fixed footer; bulk bars on job detail use z-30 so they sit above this footer (z-20) --}}
+    <main class="min-w-0 flex-1 w-full max-w-none px-4 pb-20 pt-4 sm:px-6 sm:pb-20 sm:pt-6 lg:px-8">
         @if(session('success'))
             <div class="mb-4 px-4 py-2 rounded bg-green-100 dark:bg-green-900/30 text-green-800 dark:text-green-200">{{ session('success') }}</div>
         @endif
@@ -122,9 +137,14 @@
         @yield('content')
     </main>
 
-    <footer class="border-t border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] bg-[var(--color-studio-bg-card)] dark:bg-[var(--color-studio-dark-card)] py-3 mt-auto">
-        <div class="w-full max-w-none px-4 sm:px-6 lg:px-8 text-center text-sm text-slate-500 dark:text-slate-400">
-            Developed by <a href="https://olextodigital.com" target="_blank" rel="noopener noreferrer" class="text-[var(--color-studio-primary)] dark:text-[var(--color-studio-accent)] hover:underline">Olexto Digital Solutions (Pvt) Ltd</a>
+    <footer class="fixed bottom-0 left-0 right-0 z-20 border-t border-slate-200/90 bg-[var(--color-studio-bg-card)]/92 py-2.5 shadow-[0_-6px_24px_-8px_rgba(15,23,42,0.1)] backdrop-blur-md dark:border-slate-700/80 dark:bg-[var(--color-studio-dark-card)]/92 dark:shadow-[0_-8px_28px_-10px_rgba(0,0,0,0.35)] pb-[max(0.625rem,env(safe-area-inset-bottom))]">
+        <div class="mx-auto flex w-full max-w-none flex-col items-center justify-center gap-1 px-4 text-center sm:flex-row sm:gap-2 sm:px-6 lg:px-8">
+            <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500">Studio</span>
+            <span class="hidden h-3 w-px bg-slate-300 dark:bg-slate-600 sm:inline" aria-hidden="true"></span>
+            <p class="text-xs text-slate-600 dark:text-slate-300 sm:text-sm">
+                Crafted by
+                <a href="https://olextodigital.com" target="_blank" rel="noopener noreferrer" class="font-medium text-[var(--color-studio-primary)] underline decoration-slate-300 underline-offset-2 transition hover:decoration-[var(--color-studio-primary)] dark:text-[var(--color-studio-accent)] dark:decoration-slate-600 dark:hover:decoration-[var(--color-studio-accent)]">Olexto Digital Solutions (Pvt) Ltd</a>
+            </p>
         </div>
     </footer>
     <script>

@@ -5,11 +5,13 @@ namespace App\Http\Controllers;
 use App\Models\ActivityLog;
 use App\Models\EditorCategory;
 use App\Models\Job;
+use App\Models\JobEdit;
 use App\Models\User;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Validation\Rule;
 use Illuminate\Validation\Rules\Password;
 use Illuminate\View\View;
 
@@ -56,9 +58,18 @@ class UserController extends Controller
             })->whereIn('status', [Job::STATUS_COMPLETED, Job::STATUS_DELIVERED])->count(),
             'jobs_delivered_by' => $user->id ? Job::where('delivered_by', $user->id)->count() : 0,
             'activity_count' => ActivityLog::where('user_id', $user->id)->count(),
+            'estimated_total_minutes' => JobEdit::where('claimed_by_user_id', $user->id)->whereNotNull('estimated_minutes')->sum('estimated_minutes'),
+            'estimated_item_count' => JobEdit::where('claimed_by_user_id', $user->id)->whereNotNull('estimated_minutes')->count(),
         ];
 
-        return view('users.report', compact('user', 'recentActivity', 'jobsAsEditor', 'stats'));
+        $estimatedTimeItems = JobEdit::where('claimed_by_user_id', $user->id)
+            ->whereNotNull('estimated_minutes')
+            ->with('job:id,ref_number')
+            ->orderByDesc('estimated_minutes_at')
+            ->take(50)
+            ->get();
+
+        return view('users.report', compact('user', 'recentActivity', 'jobsAsEditor', 'stats', 'estimatedTimeItems'));
     }
 
     public function create(): View
@@ -73,13 +84,13 @@ class UserController extends Controller
             'name' => ['required', 'string', 'max:255'],
             'email' => ['required', 'string', 'email', 'max:255', 'unique:users'],
             'password' => ['required', 'confirmed', Password::defaults()],
-            'role' => ['required', 'in:manager,editor,printer,sales,delivery'],
+            'role' => ['required', Rule::in(array_keys(User::ROLES_FOR_CREATE))],
             'is_active' => ['nullable', 'boolean'],
         ]);
         $valid['password'] = Hash::make($valid['password']);
         $valid['is_active'] = $request->boolean('is_active', true);
         $user = User::create($valid);
-        if ($user->role === User::ROLE_EDITOR) {
+        if (in_array($user->role, User::rolesWithCategoryAssignments(), true)) {
             $ids = $request->input('category_ids', []);
             $ids = is_array($ids) ? array_filter(array_map('intval', $ids)) : [];
             foreach ($ids as $sourceCategoryId) {
@@ -102,7 +113,7 @@ class UserController extends Controller
         $valid = $request->validate([
             'name' => ['required', 'string', 'max:255'],
             'email' => ['required', 'string', 'email', 'max:255', 'unique:users,email,' . $user->id],
-            'role' => ['required', 'in:admin,manager,editor,printer,sales,delivery'],
+            'role' => ['required', Rule::in(array_merge([User::ROLE_ADMIN], array_keys(User::ROLES_FOR_CREATE)))],
             'is_active' => ['nullable', 'boolean'],
         ]);
         if (auth()->id() === $user->id && $user->role !== $valid['role']) {
@@ -120,7 +131,7 @@ class UserController extends Controller
             $request->validate(['password' => ['confirmed', Password::defaults()]]);
             $user->update(['password' => Hash::make($request->password)]);
         }
-        if ($user->role === User::ROLE_EDITOR) {
+        if (in_array($user->role, User::rolesWithCategoryAssignments(), true)) {
             $ids = $request->input('category_ids', []);
             $ids = is_array($ids) ? array_filter(array_map('intval', $ids)) : [];
             EditorCategory::where('user_id', $user->id)->delete();

@@ -20,18 +20,23 @@ class SampleUsersSeeder extends Seeder
             [User::ROLE_ADMIN, 'Admin Sample', 'admin@studiosalaru.com'],
             [User::ROLE_MANAGER, 'Manager Sample', 'manager@studiosalaru.com'],
             [User::ROLE_EDITOR, 'Editor Sample', 'editor@studiosalaru.com'],
+            [User::ROLE_EDITOR_PRINTER, 'Editor Printer Sample', 'editor-printer@studiosalaru.com'],
+            [User::ROLE_FRAMING, 'Framing Sample', 'framing@studiosalaru.com'],
+            [User::ROLE_EDITOR_PRINTER_FRAMING, 'Editor Printer Framing Sample', 'epf@studiosalaru.com'],
+            [User::ROLE_PRINTER_FRAMING, 'Printer Framing Sample', 'printer-framing@studiosalaru.com'],
             [User::ROLE_PRINTER, 'Printer Sample', 'printer@studiosalaru.com'],
             [User::ROLE_SALES, 'Sales Sample', 'sales@studiosalaru.com'],
             [User::ROLE_DELIVERY, 'Delivery Sample', 'delivery@studiosalaru.com'],
         ];
 
         foreach ($samples as [$role, $name, $email]) {
-            User::firstOrCreate(
+            User::updateOrCreate(
                 ['email' => $email],
                 [
                     'name' => $name,
                     'password' => Hash::make(self::SAMPLE_PASSWORD),
                     'role' => $role,
+                    'is_active' => true,
                 ]
             );
         }

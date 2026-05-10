@@ -31,8 +31,6 @@ class SourceProductsController extends Controller
                     'p.id',
                     'p.code',
                     'p.name',
-                    'p.price',
-                    'p.quantity',
                     'cat.name as category_name',
                     'cat.code as category_code',
                     'sub.name as subcategory_name',

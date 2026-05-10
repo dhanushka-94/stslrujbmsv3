@@ -25,6 +25,21 @@
             </div>
         </a>
 
+        @if(auth()->user()->isAdmin() || auth()->user()->isManager())
+            {{-- Editor time report --}}
+            <a href="{{ route('reports.editor-time') }}" class="block p-6 rounded-lg border border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] bg-[var(--color-studio-bg-card)] dark:bg-[var(--color-studio-dark-card)] hover:border-[var(--color-studio-primary)]/50 shadow-sm transition-colors">
+                <div class="flex items-center gap-3">
+                    <span class="flex h-12 w-12 items-center justify-center rounded-lg bg-[var(--color-studio-primary)]/10 text-[var(--color-studio-primary)]">
+                        @include('components.icons', ['name' => 'clock', 'class' => 'w-6 h-6'])
+                    </span>
+                    <div>
+                        <h2 class="font-medium text-slate-800 dark:text-slate-100">Editor time report</h2>
+                        <p class="text-sm text-slate-500 dark:text-slate-400">Estimated time (workload) per editor with date/time log.</p>
+                    </div>
+                </div>
+            </a>
+        @endif
+
         @if(auth()->user()->isAdmin())
             {{-- Activity log --}}
             <a href="{{ route('activity-log.index') }}" class="block p-6 rounded-lg border border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] bg-[var(--color-studio-bg-card)] dark:bg-[var(--color-studio-dark-card)] hover:border-[var(--color-studio-primary)]/50 shadow-sm transition-colors">

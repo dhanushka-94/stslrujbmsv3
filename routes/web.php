@@ -10,6 +10,7 @@ use App\Http\Controllers\ProfileController;
 use App\Http\Controllers\ReportController;
 use App\Http\Controllers\SourceCategoriesController;
 use App\Http\Controllers\SourceProductsController;
+use App\Http\Controllers\SourceSalesController;
 use App\Http\Controllers\UserController;
 use Illuminate\Support\Facades\Route;
 
@@ -35,6 +36,7 @@ Route::middleware('auth')->group(function () {
 
     Route::get('users/{user}/report', [UserController::class, 'report'])->name('users.report');
     Route::get('reports', [ReportController::class, 'index'])->name('reports.index');
+    Route::get('reports/editor-time', [ReportController::class, 'editorTimeReport'])->name('reports.editor-time');
 
     Route::get('jobs', [JobController::class, 'index'])->name('jobs.index');
     Route::get('jobs/live', [JobController::class, 'live'])->name('jobs.live');
@@ -44,9 +46,17 @@ Route::middleware('auth')->group(function () {
     Route::post('jobs/{job}/take', [JobController::class, 'take'])->name('jobs.take');
     Route::post('jobs/{job}/status', [JobController::class, 'updateStatus'])->name('jobs.status');
     Route::post('jobs/{job}/edits/{edit}/claim', [JobController::class, 'claimEdit'])->name('jobs.edits.claim');
+    Route::post('jobs/{job}/edits/{edit}/estimated-minutes', [JobController::class, 'updateEstimatedMinutes'])->name('jobs.edits.estimated-minutes');
     Route::post('jobs/{job}/edits/{edit}/customer-confirm', [JobController::class, 'confirmCustomer'])->name('jobs.edits.customer-confirm');
     Route::post('jobs/{job}/edits/{edit}/customer-unconfirm', [JobController::class, 'unconfirmCustomer'])->name('jobs.edits.customer-unconfirm');
+    Route::post('jobs/{job}/edits/{edit}/sent-to-customer', [JobController::class, 'markSentToCustomer'])->name('jobs.edits.sent-to-customer');
+    Route::post('jobs/{job}/edits/{edit}/reedit', [JobController::class, 'markReEdit'])->name('jobs.edits.reedit');
+    Route::post('jobs/{job}/edits/{edit}/framing-done/clear', [JobController::class, 'unmarkFramingDone'])->name('jobs.edits.framing-done-clear');
+    Route::post('jobs/{job}/edits/{edit}/framing-done', [JobController::class, 'markFramingDone'])->name('jobs.edits.framing-done');
+    Route::post('jobs/{job}/edits/{edit}/step-back', [JobController::class, 'stepBackEditorStatus'])->name('jobs.edits.step-back');
+    Route::post('jobs/{job}/edits/{edit}/edit-done', [JobController::class, 'markEditDone'])->name('jobs.edits.edit-done');
     Route::post('jobs/{job}/edits/{edit}/edit-status', [JobController::class, 'updateEditStatus'])->name('jobs.edits.edit-status');
+    Route::post('jobs/{job}/edits/bulk', [JobController::class, 'bulkEdits'])->name('jobs.edits.bulk');
     Route::post('jobs/{job}/edits/{edit}/print-status', [JobController::class, 'updatePrintStatus'])->name('jobs.edits.print-status');
     Route::post('jobs/{job}/deliver', [JobController::class, 'deliver'])->name('jobs.deliver');
     Route::post('jobs/{job}/editors', [JobController::class, 'addEditor'])->name('jobs.editors.add');
@@ -61,6 +71,7 @@ Route::middleware('auth')->group(function () {
         // Settings: Catalog & Visibility
         Route::get('source-products', [SourceProductsController::class, 'index'])->name('source-products.index');
         Route::get('source-categories', [SourceCategoriesController::class, 'index'])->name('source-categories.index');
+        Route::get('settings/pos-sales', [SourceSalesController::class, 'index'])->name('settings.pos-sales');
         Route::get('settings/block-categories', [BlockedCategoriesController::class, 'index'])->name('settings.block-categories');
         Route::post('settings/block-categories', [BlockedCategoriesController::class, 'store'])->name('settings.block-categories.store');
         Route::get('settings/block-products', [BlockedProductsController::class, 'index'])->name('settings.block-products');

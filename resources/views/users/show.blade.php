@@ -52,7 +52,7 @@
                     @endif
                 </dd>
             </div>
-            @if($user->role === \App\Models\User::ROLE_EDITOR && $user->editorCategories->isNotEmpty())
+            @if(in_array($user->role, \App\Models\User::rolesWithCategoryAssignments(), true) && $user->editorCategories->isNotEmpty())
                 <div>
                     <dt class="text-sm font-medium text-slate-500 dark:text-slate-400">Allowed categories</dt>
                     <dd class="mt-0.5 text-slate-700 dark:text-slate-300">

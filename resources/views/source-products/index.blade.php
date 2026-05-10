@@ -22,8 +22,6 @@
                         <th class="text-left p-3">Product name</th>
                         <th class="text-left p-3">Category</th>
                         <th class="text-left p-3">Subcategory</th>
-                        <th class="text-right p-3">Price</th>
-                        <th class="text-right p-3">Qty</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -33,11 +31,9 @@
                             <td class="p-3">{{ $p->name ?? '—' }}</td>
                             <td class="p-3">{{ $p->category_name ?? '—' }}</td>
                             <td class="p-3">{{ $p->subcategory_name ?? '—' }}</td>
-                            <td class="p-3 text-right">{{ $p->price !== null ? number_format((float) $p->price, 2) : '—' }}</td>
-                            <td class="p-3 text-right">{{ $p->quantity !== null ? number_format((float) $p->quantity, 2) : '—' }}</td>
                         </tr>
                     @empty
-                        <tr><td colspan="6" class="p-6 text-center text-slate-500">No products or source DB not connected.</td></tr>
+                        <tr><td colspan="4" class="p-6 text-center text-slate-500">No products or source DB not connected.</td></tr>
                     @endforelse
                 </tbody>
             </table>

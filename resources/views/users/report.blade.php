@@ -64,6 +64,12 @@
                     <div class="text-xl font-bold text-slate-600">{{ $stats['activity_count'] }}</div>
                     <div class="text-xs text-slate-500">Total activity entries</div>
                 </div>
+                @if($stats['estimated_item_count'] > 0)
+                    <div class="bg-[var(--color-studio-bg-card)] dark:bg-[var(--color-studio-dark-card)] border border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] rounded-lg p-4 shadow-sm col-span-2">
+                        <div class="text-xl font-bold text-[var(--color-studio-primary)]">{{ number_format($stats['estimated_total_minutes']) }} min</div>
+                        <div class="text-xs text-slate-500">Est. time ({{ $stats['estimated_item_count'] }} items)</div>
+                    </div>
+                @endif
             </div>
         </div>
 
@@ -101,6 +107,44 @@
                     </table>
                 </div>
             </div>
+
+            @if($estimatedTimeItems->isNotEmpty())
+                {{-- Estimated time (workload) --}}
+                <div class="bg-[var(--color-studio-bg-card)] dark:bg-[var(--color-studio-dark-card)] border border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] rounded-lg overflow-hidden shadow-sm">
+                    <h2 class="text-sm font-medium text-slate-500 dark:text-slate-400 px-4 pt-4 pb-2 flex items-center gap-2">
+                        @include('components.icons', ['name' => 'clock', 'class' => 'w-4 h-4'])
+                        Estimated time (workload) – {{ number_format($stats['estimated_total_minutes']) }} min total
+                    </h2>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead class="bg-slate-50 dark:bg-slate-800/50">
+                                <tr>
+                                    <th class="text-left p-3">Job</th>
+                                    <th class="text-left p-3">Item</th>
+                                    <th class="text-right p-3">Est. (min)</th>
+                                    <th class="text-left p-3">Set at</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach($estimatedTimeItems as $edit)
+                                    <tr class="border-t border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)]">
+                                        <td class="p-3">
+                                            @if($edit->job)
+                                                <a href="{{ route('jobs.show', $edit->job) }}" class="text-[var(--color-studio-primary)] hover:underline font-mono">{{ $edit->job->ref_number }}</a>
+                                            @else
+                                                —
+                                            @endif
+                                        </td>
+                                        <td class="p-3">{{ $edit->name }}</td>
+                                        <td class="p-3 text-right">{{ $edit->estimated_minutes }}</td>
+                                        <td class="p-3 text-slate-600 dark:text-slate-400">{{ $edit->estimated_minutes_at ? $edit->estimated_minutes_at->format('M j, H:i') : '—' }}</td>
+                                    </tr>
+                                @endforeach
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            @endif
 
             {{-- Recent activity --}}
             <div class="bg-[var(--color-studio-bg-card)] dark:bg-[var(--color-studio-dark-card)] border border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] rounded-lg overflow-hidden shadow-sm">
