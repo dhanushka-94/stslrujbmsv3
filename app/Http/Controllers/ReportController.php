@@ -14,7 +14,7 @@ class ReportController extends Controller
      */
     public function index(): View
     {
-        $users = auth()->user()->isAdmin()
+        $users = (auth()->user()->isAdmin() || auth()->user()->isManager())
             ? User::orderBy('name')->get(['id', 'name', 'email', 'role'])
             : collect();
 

@@ -250,8 +250,7 @@ class User extends Authenticatable
     }
 
     /**
-     * Printer / framing-only roles: Job Pool lists existing jobs with print or framing queue lines only (not all POS sales).
-     * Users who can edit (editor, editor_printer, editor_printer_framing) keep the full POS pool.
+     * Printer / framing-only roles: Job Pool shows all eligible POS sales (not only unopened ones); Jobs list uses studio job scope.
      */
     public function usesDedicatedPrintFramingJobPool(): bool
     {
@@ -292,6 +291,18 @@ class User extends Authenticatable
     public function canTakeJob(): bool
     {
         return $this->isEditor();
+    }
+
+    /** Create a studio job from a POS sale on the Job Pool page. */
+    public function canOpenJobFromPool(): bool
+    {
+        return $this->canManageJobs()
+            || $this->canTakeJob()
+            || in_array($this->role, [
+                self::ROLE_PRINTER,
+                self::ROLE_FRAMING,
+                self::ROLE_PRINTER_FRAMING,
+            ], true);
     }
 
     /** Update print status: Admin, Printer, Editor + Printer, composite printer roles. */

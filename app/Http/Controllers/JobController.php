@@ -48,7 +48,7 @@ class JobController extends Controller
         if (! $user) {
             return redirect()->route('login');
         }
-        if (! $user->canManageJobs() && ! $user->canTakeJob()) {
+        if (! $user->canOpenJobFromPool()) {
             abort(403);
         }
 
@@ -211,33 +211,31 @@ class JobController extends Controller
             return redirect()->route('jobs.index')->with('error', 'Source database not configured. Check DB_SOURCE_DATABASE in .env.');
         }
 
-        if ($user->usesDedicatedPrintFramingJobPool()) {
-            return $this->liveDedicatedPrintFramingPool($request, $user, $conn, $ref, $page, $perPage);
-        }
-
         try {
-            // Exclude POS sales that already have a STARTED job for this user (editor),
-            // or for anyone (for non-editors). "Started" = assigned, in_progress, completed, delivered.
-            $startedJobQuery = Job::whereNotNull('source_id')
-                ->whereIn('status', [
-                    Job::STATUS_ASSIGNED,
-                    Job::STATUS_IN_PROGRESS,
-                    Job::STATUS_COMPLETED,
-                    Job::STATUS_DELIVERED,
-                ]);
+            // Exclude POS sales that already have a STARTED job (editor: only their jobs; others: any started job).
+            // Printer / framing / printer+framing: show every eligible POS sale (opened or not).
+            $usedSourceIds = [];
+            if (! $user->usesDedicatedPrintFramingJobPool()) {
+                $startedJobQuery = Job::whereNotNull('source_id')
+                    ->whereIn('status', [
+                        Job::STATUS_ASSIGNED,
+                        Job::STATUS_IN_PROGRESS,
+                        Job::STATUS_COMPLETED,
+                        Job::STATUS_DELIVERED,
+                    ]);
 
-            if ($user->isEditor()) {
-                // For editors: only hide POS rows where this user already has a started job.
-                $startedJobQuery->where(function ($q) use ($user) {
-                    $q->where('assigned_editor_id', $user->id)
-                        ->orWhereHas('editors', fn ($qq) => $qq->where('user_id', $user->id));
-                });
+                if ($user->isEditor()) {
+                    $startedJobQuery->where(function ($q) use ($user) {
+                        $q->where('assigned_editor_id', $user->id)
+                            ->orWhereHas('editors', fn ($qq) => $qq->where('user_id', $user->id));
+                    });
+                }
+
+                $usedSourceIds = $startedJobQuery
+                    ->pluck('source_id')
+                    ->map(fn ($id) => (int) $id)
+                    ->all();
             }
-
-            $usedSourceIds = $startedJobQuery
-                ->pluck('source_id')
-                ->map(fn ($id) => (int) $id)
-                ->all();
 
             $tz = config('app.timezone');
             $minSaleDate = Carbon::parse(Job::SOURCE_JOB_POOL_MIN_SALE_DATE, $tz)->startOfDay();
@@ -365,104 +363,6 @@ class JobController extends Controller
         ]);
     }
 
-    /**
-     * Job Pool for dedicated printer / framing roles: existing jobs only, with at least one line needing print (after edit done) or framing.
-     */
-    private function liveDedicatedPrintFramingPool(Request $request, User $user, string $conn, ?string $ref, int $page, int $perPage): View|RedirectResponse
-    {
-        try {
-            $jobsQuery = Job::queryDedicatedPrintFramingJobPool($user);
-            $jobsQuery = Job::applyJobPoolEligiblePosSaleExists($jobsQuery);
-            if ($ref) {
-                $jobsQuery->where('studio_jobs.ref_number', 'like', '%' . $ref . '%');
-            }
-            $jobsQuery = Job::orderJobPoolByPosDueDate($jobsQuery);
-
-            $total = $jobsQuery->count();
-            $jobs = $jobsQuery->forPage($page, $perPage)->get();
-
-            $sourceIds = $jobs->pluck('source_id')->map(fn ($id) => (int) $id)->filter()->unique()->values()->all();
-
-            $posRows = collect();
-            if ($sourceIds !== []) {
-                $posRows = DB::connection($conn)->table('sma_sales')->whereIn('id', $sourceIds)->get()->keyBy('id');
-            }
-
-            $salesCollection = $jobs->map(function (Job $job) use ($posRows) {
-                $row = $posRows->get((int) $job->source_id);
-                if ($row) {
-                    return $row;
-                }
-
-                return (object) [
-                    'id' => (int) $job->source_id,
-                    'reference_no' => $job->ref_number,
-                    'customer' => $job->customer_name,
-                    'payment_status' => '',
-                    'due_date' => $job->due_date?->format('Y-m-d H:i:s'),
-                    'date' => $job->created_at?->format('Y-m-d H:i:s'),
-                ];
-            });
-
-            $paginator = new LengthAwarePaginator(
-                $salesCollection,
-                $total,
-                $perPage,
-                $page,
-                [
-                    'path' => route('jobs.live'),
-                    'query' => $request->query(),
-                ]
-            );
-
-            $jobsBySourceId = $jobs->keyBy(fn (Job $j) => (string) $j->source_id);
-
-            $itemsBySaleId = collect();
-            if ($sourceIds !== []) {
-                try {
-                    $itemsQuery = DB::connection($conn)
-                        ->table('sma_sale_items as si')
-                        ->whereIn('si.sale_id', $sourceIds)
-                        ->orderBy('si.id')
-                        ->leftJoin('sma_products as p', 'si.product_id', '=', 'p.id');
-
-                    if ($user->isEditor()) {
-                        $allowed = $user->assignedCategoryIds();
-                        if (! empty($allowed)) {
-                            $itemsQuery->whereIn('p.category_id', $allowed);
-                        }
-                    }
-
-                    $itemsBySaleId = $itemsQuery
-                        ->get(['si.sale_id', 'si.product_name', 'si.quantity', 'si.product_id'])
-                        ->groupBy('sale_id')
-                        ->map(function ($group) use ($conn) {
-                            return SaleItemsJobEditsBuilder::namesForJobPool($conn, $group->all());
-                        });
-                } catch (\Throwable) {
-                    // leave empty
-                }
-            }
-        } catch (\Throwable $e) {
-            return redirect()->route('jobs.index')->with('error', 'Cannot load print/framing job pool: ' . $e->getMessage());
-        }
-
-        if ($user && Schema::hasColumn('users', 'job_pool_last_checked_at')) {
-            try {
-                $user->forceFill(['job_pool_last_checked_at' => now()])->save();
-            } catch (\Throwable) {
-            }
-        }
-
-        return view('jobs.live', [
-            'sales' => $paginator,
-            'jobsBySourceId' => $jobsBySourceId,
-            'itemsBySaleId' => $itemsBySaleId,
-            'ref' => $ref,
-            'jobPoolMode' => 'print_framing',
-        ]);
-    }
-
     public function index(Request $request): View|RedirectResponse
     {
         $user = auth()->user();
@@ -512,8 +412,9 @@ class JobController extends Controller
 
         $printFramingQueueIds = null;
         if ($user->usesDedicatedPrintFramingJobPool() && ! $user->isEditor()) {
-            $printFramingQueueIds = Job::applyJobPoolEligiblePosSaleExists(
-                Job::queryDedicatedPrintFramingJobPool($user)
+            $printFramingQueueIds = Job::applyJobPoolGateForDedicatedPool(
+                Job::queryDedicatedPrintFramingJobPool($user),
+                $user
             )->pluck('id')->all();
         }
 

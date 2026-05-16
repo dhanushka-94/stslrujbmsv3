@@ -31,11 +31,11 @@ class UserController extends Controller
 
     /**
      * User report page: activity summary, jobs involved, recent activity log.
-     * Accessible by the user themselves or by Admin.
+     * Accessible by the user themselves, or by Admin / Manager (same oversight level as editor time report).
      */
     public function report(User $user): View
     {
-        if (auth()->id() !== $user->id && ! auth()->user()->isAdmin()) {
+        if (auth()->id() !== $user->id && ! auth()->user()->isAdmin() && ! auth()->user()->isManager()) {
             abort(403);
         }
         $user->load('editorCategories');

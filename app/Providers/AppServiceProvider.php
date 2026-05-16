@@ -49,30 +49,6 @@ class AppServiceProvider extends ServiceProvider
             $lastChecked = $user->job_pool_last_checked_at;
 
             try {
-                if ($user->usesDedicatedPrintFramingJobPool()) {
-                    $q = Job::queryDedicatedPrintFramingJobPool($user);
-                    $q = Job::applyJobPoolEligiblePosSaleExists($q);
-                    if ($lastChecked) {
-                        $q->where(function ($w) use ($lastChecked) {
-                            $w->where('studio_jobs.updated_at', '>', $lastChecked)
-                                ->orWhereHas('edits', function ($e) use ($lastChecked) {
-                                    $e->where('updated_at', '>', $lastChecked);
-                                });
-                        });
-                    }
-                    $count = $q->count();
-                    $view->with([
-                        'jobPoolNewCount' => $count,
-                        'jobPoolNotifyTitle' => $lastChecked
-                            ? ($count > 0
-                                ? "Job Pool: {$count} job(s) updated or with line changes since you last opened Job Pool (".($lastChecked->timezone(config('app.timezone'))->format('M j, g:i A')).")."
-                                : 'Job Pool: nothing new since your last visit. Open Job Pool to refresh.')
-                            : "Job Pool: {$count} job(s) in your print/framing queue right now.",
-                    ]);
-
-                    return;
-                }
-
                 $tz = config('app.timezone');
                 $minSaleDate = Carbon::parse(Job::SOURCE_JOB_POOL_MIN_SALE_DATE, $tz)->startOfDay();
 
@@ -106,7 +82,7 @@ class AppServiceProvider extends ServiceProvider
                     ->map(fn ($id) => (int) $id)
                     ->all();
 
-                if (! empty($usedSourceIds)) {
+                if (! empty($usedSourceIds) && ! $user->usesDedicatedPrintFramingJobPool()) {
                     $query->whereNotIn('id', $usedSourceIds);
                 }
 

@@ -56,7 +56,7 @@
         @endif
     </div>
 
-    @if(auth()->user()->isAdmin() && $users->isNotEmpty())
+    @if((auth()->user()->isAdmin() || auth()->user()->isManager()) && $users->isNotEmpty())
         <div class="mt-8 max-w-3xl">
             <h2 class="text-lg font-medium mb-3 flex items-center gap-2">
                 @include('components.icons', ['name' => 'users', 'class' => 'w-5 h-5'])

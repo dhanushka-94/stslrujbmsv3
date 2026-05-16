@@ -15,11 +15,7 @@
                         <span class="text-[var(--color-studio-primary)] dark:text-[var(--color-studio-accent)]">Job Pool</span>
                     </h1>
                     <p class="mt-2 max-w-2xl text-sm text-slate-600 dark:text-slate-300">
-                        @if(($jobPoolMode ?? 'pos') === 'print_framing')
-                            Jobs already in the system that need printing (edit done) or framing. Open a job to update print or framing status.
-                        @else
-                            Paid sales from the source database. Open a sale to create a job or jump to the jobs list.
-                        @endif
+                        Paid sales from the source database (including jobs already opened). Open a sale to create a job, or open an existing job to update print or framing.
                     </p>
                 </div>
                 <a href="{{ route('jobs.index') }}" class="inline-flex shrink-0 items-center gap-2 self-start rounded-lg border border-[var(--color-studio-border)] bg-white/90 px-4 py-2.5 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-white dark:border-[var(--color-studio-dark-border)] dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700/90">
@@ -79,17 +75,28 @@
             @forelse($sales as $sale)
                 @php
                     $tz = config('app.timezone');
-                    $dueAt = \Illuminate\Support\Carbon::parse($sale->due_date)->timezone($tz);
                     $job = $jobsBySourceId[(string) $sale->id] ?? null;
                     $items = $itemsBySaleId[$sale->id] ?? [];
-                    $hasDue = !empty($sale->due_date) && $sale->due_date !== '0000-00-00';
-                    $isOverdue = $hasDue && $dueAt->isPast();
+                    $dueAt = \App\Models\Job::resolveDueFromStoredAndPos(
+                        $job?->due_date,
+                        $sale->due_date ?? null
+                    );
+                    $hasDue = $dueAt !== null;
+                    $isOverdue = $hasDue && \App\Models\Job::isDueCarbonPastDeadline($dueAt, false);
+                    $saleAt = null;
+                    if (! empty($sale->date)) {
+                        try {
+                            $saleAt = \Illuminate\Support\Carbon::parse($sale->date)->timezone($tz);
+                        } catch (\Throwable) {
+                            $saleAt = null;
+                        }
+                    }
                 @endphp
                 <tr class="{{ $isOverdue ? 'bg-rose-50/60 dark:bg-rose-900/20 border-l-4 border-l-rose-500 dark:border-l-rose-400' : 'bg-white dark:bg-slate-900' }}">
                     <td class="p-3 align-top font-mono break-all">{{ $sale->reference_no }}</td>
                     <td class="p-3 align-top">
-                        @if(!empty($sale->date))
-                            {{ \Illuminate\Support\Carbon::parse($sale->date)->timezone($tz)->format('M d, Y h:i A') }}
+                        @if($saleAt)
+                            {{ $saleAt->format('M d, Y h:i A') }}
                         @else
                             —
                         @endif
@@ -159,7 +166,7 @@
                                     @include('components.icons', ['name' => 'eye', 'class' => 'w-4 h-4'])
                                     Open job
                                 </a>
-                            @elseif(($jobPoolMode ?? 'pos') !== 'print_framing')
+                            @elseif(auth()->user()->canOpenJobFromPool())
                                 <form action="{{ route('jobs.from-source', $sale->id) }}" method="POST" class="inline">
                                     @csrf
                                     <button type="submit"
@@ -169,7 +176,7 @@
                                     </button>
                                 </form>
                             @else
-                                <span class="text-xs text-slate-400">Job record missing — contact admin.</span>
+                                <span class="text-xs text-slate-400">Not opened yet — ask editor or manager to open this sale.</span>
                             @endif
                         </div>
                     </td>
@@ -180,18 +187,10 @@
                         <div class="mx-auto inline-flex max-w-md flex-col items-center rounded-xl border border-dashed border-[var(--color-studio-border)] bg-slate-50/60 px-6 py-8 dark:border-[var(--color-studio-dark-border)] dark:bg-slate-800/30">
                             @include('components.icons', ['name' => 'folder', 'class' => 'h-10 w-10 text-slate-400 dark:text-slate-500'])
                             <p class="mt-3 text-sm font-medium text-slate-600 dark:text-slate-300">
-                                @if(($jobPoolMode ?? 'pos') === 'print_framing')
-                                    No jobs need printing or framing right now (or nothing matches this reference).
-                                @else
-                                    No sales match this filter
-                                @endif
+                                No sales match this filter
                             </p>
                             <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                                @if(($jobPoolMode ?? 'pos') === 'print_framing')
-                                    Lines must be edit-done before print; framing lines need framing marked, or non-frame lines need print completed first.
-                                @else
-                                    Try another reference or clear the filter.
-                                @endif
+                                Try another reference or clear the filter.
                             </p>
                         </div>
                     </td>

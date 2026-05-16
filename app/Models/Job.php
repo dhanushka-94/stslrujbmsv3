@@ -68,7 +68,7 @@ class Job extends Model
     ];
 
     /** First calendar day of POS `sma_sales.date` included in Job Pool (app timezone applied when querying). */
-    public const SOURCE_JOB_POOL_MIN_SALE_DATE = '2026-04-01';
+    public const SOURCE_JOB_POOL_MIN_SALE_DATE = '2026-05-01';
 
     public const DELIVERY_ONLINE = 'online';
     public const DELIVERY_WALKIN = 'walkin';
@@ -264,33 +264,36 @@ class Job extends Model
     }
 
     /**
-     * Studio jobs shown on Job Pool for dedicated printer / framing users.
+     * Studio jobs shown on Job Pool for dedicated printer / framing users (all opened jobs, not only lines in print/framing queue).
      */
     public static function queryDedicatedPrintFramingJobPool(User $user): Builder
     {
         $blockedCats = BlockedCategory::blockedCategoryIds();
         $blockedProds = BlockedProduct::blockedProductIds();
 
-        $showPrint = $user->jobPoolShowsPrintQueue();
-        $showFraming = $user->jobPoolShowsFramingQueue();
-
-        $q = static::query()
+        return static::query()
             ->whereNotNull('source_id')
             ->where('status', '!=', self::STATUS_DELIVERED)
-            ->where(function ($outer) use ($user, $blockedCats, $blockedProds, $showPrint, $showFraming) {
-                if ($showPrint) {
-                    $outer->orWhereHas('edits', function ($ed) use ($blockedCats, $blockedProds) {
-                        self::constrainJobEditScopeForPrintQueue($ed, $blockedCats, $blockedProds);
-                    });
-                }
-                if ($showFraming) {
-                    $outer->orWhereHas('edits', function ($ed) use ($blockedCats, $blockedProds, $user) {
-                        self::constrainJobEditScopeForFramingQueue($ed, $blockedCats, $blockedProds, $user);
-                    });
-                }
+            ->whereHas('edits', function ($ed) use ($blockedCats, $blockedProds) {
+                self::applyBlockedCatalogToJobEditQuery($ed, $blockedCats, $blockedProds);
             });
+    }
 
-        return $q;
+    /**
+     * @param  Builder<\App\Models\JobEdit>  $ed
+     */
+    protected static function applyBlockedCatalogToJobEditQuery(Builder $ed, array $blockedCats, array $blockedProds): void
+    {
+        if ($blockedCats !== []) {
+            $ed->where(function ($qq) use ($blockedCats) {
+                $qq->whereNull('source_category_id')->orWhereNotIn('source_category_id', $blockedCats);
+            });
+        }
+        if ($blockedProds !== []) {
+            $ed->where(function ($qq) use ($blockedProds) {
+                $qq->whereNull('source_product_id')->orWhereNotIn('source_product_id', $blockedProds);
+            });
+        }
     }
 
     /**
@@ -315,13 +318,34 @@ class Job extends Model
         });
     }
 
+    /**
+     * Dedicated printer / framing Job Pool lists all opened studio jobs; do not hide jobs when POS payment/date/due changes.
+     */
+    public static function applyJobPoolGateForDedicatedPool(Builder $jobQuery, User $user): Builder
+    {
+        return $jobQuery;
+    }
+
     public static function orderJobPoolByPosDueDate(Builder $jobQuery): Builder
     {
         $sourceDb = config('database.connections.source.database');
+        if (empty($sourceDb)) {
+            return $jobQuery
+                ->orderBy('studio_jobs.due_date')
+                ->orderBy('studio_jobs.created_at');
+        }
 
         return $jobQuery
-            ->orderByRaw('(SELECT sp.due_date FROM `'.$sourceDb.'`.sma_sales sp WHERE sp.id = CAST(studio_jobs.source_id AS UNSIGNED) LIMIT 1)')
-            ->orderByRaw('(SELECT sp2.`date` FROM `'.$sourceDb.'`.sma_sales sp2 WHERE sp2.id = CAST(studio_jobs.source_id AS UNSIGNED) LIMIT 1)');
+            ->orderByRaw(
+                'COALESCE('
+                .'(SELECT sp.due_date FROM `'.$sourceDb.'`.sma_sales sp WHERE sp.id = CAST(studio_jobs.source_id AS UNSIGNED) LIMIT 1),'
+                .'studio_jobs.due_date)'
+            )
+            ->orderByRaw(
+                'COALESCE('
+                .'(SELECT sp2.`date` FROM `'.$sourceDb.'`.sma_sales sp2 WHERE sp2.id = CAST(studio_jobs.source_id AS UNSIGNED) LIMIT 1),'
+                .'studio_jobs.created_at)'
+            );
     }
 
     /**
@@ -331,7 +355,7 @@ class Job extends Model
     {
         $ed->whereNotNull('edit_done_at')
             ->whereIn('print_status', [JobEdit::PRINT_STATUS_PENDING, JobEdit::PRINT_STATUS_SENT_TO_PRINT])
-            ->whereRaw('LOWER(TRIM(category_name)) <> ?', ['frame']);
+            ->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) <> ?', ['FRAME']);
 
         if ($blockedCats !== []) {
             $ed->where(function ($qq) use ($blockedCats) {
@@ -346,6 +370,10 @@ class Job extends Model
     }
 
     /**
+     * Framing Job Pool: (1) FRAME category lines still needing framing, or (2) non-frame lines that are printed
+     * (or print not required) and still need framing. Uses IFNULL(category_name) so NULL POS category rows are not dropped.
+     * When the user has allowed POS categories, lines with null source_category_id still match (name-only frame / printed photo).
+     *
      * @param  Builder<\App\Models\JobEdit>  $ed
      */
     protected static function constrainJobEditScopeForFramingQueue(Builder $ed, array $blockedCats, array $blockedProds, User $user): void
@@ -364,18 +392,25 @@ class Job extends Model
         }
 
         $allowed = $user->assignedCategoryIds();
+        $printedTerminal = [JobEdit::PRINT_STATUS_PRINTED, JobEdit::PRINT_STATUS_NOT_REQUIRED];
 
-        $ed->where(function ($w) use ($allowed) {
+        $ed->where(function ($w) use ($allowed, $printedTerminal) {
             $w->where(function ($frameOnly) use ($allowed) {
-                $frameOnly->whereRaw('LOWER(TRIM(category_name)) = ?', ['frame']);
+                $frameOnly->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) = ?', ['FRAME']);
                 if ($allowed !== []) {
-                    $frameOnly->whereNotNull('source_category_id')->whereIn('source_category_id', $allowed);
+                    $frameOnly->where(function ($cat) use ($allowed) {
+                        $cat->whereNull('source_category_id')
+                            ->orWhereIn('source_category_id', $allowed);
+                    });
                 }
-            })->orWhere(function ($afterPrint) use ($allowed) {
-                $afterPrint->whereRaw('LOWER(TRIM(category_name)) <> ?', ['frame'])
-                    ->where('print_status', JobEdit::PRINT_STATUS_PRINTED);
+            })->orWhere(function ($afterPrint) use ($allowed, $printedTerminal) {
+                $afterPrint->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) <> ?', ['FRAME'])
+                    ->whereIn('print_status', $printedTerminal);
                 if ($allowed !== []) {
-                    $afterPrint->whereNotNull('source_category_id')->whereIn('source_category_id', $allowed);
+                    $afterPrint->where(function ($cat) use ($allowed) {
+                        $cat->whereNull('source_category_id')
+                            ->orWhereIn('source_category_id', $allowed);
+                    });
                 }
             });
         });
