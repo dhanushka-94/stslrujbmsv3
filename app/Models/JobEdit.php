@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Support\CategoryWorkflow;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -81,12 +82,87 @@ class JobEdit extends Model
     public const PRINT_STATUS_SENT_TO_PRINT = 'sent_to_print';
     public const PRINT_STATUS_PRINTED = 'printed';
 
-    /**
-     * POS category_name "FRAME" (case-insensitive): framing-only line — no editor or print workflow.
-     */
+    /** @return list<string> */
+    public static function terminalPrintStatuses(): array
+    {
+        return [self::PRINT_STATUS_PRINTED, self::PRINT_STATUS_NOT_REQUIRED];
+    }
+
+    public static function isTerminalPrintStatus(?string $status): bool
+    {
+        return in_array($status, self::terminalPrintStatuses(), true);
+    }
+
+    public function hasPrintDone(): bool
+    {
+        return self::isTerminalPrintStatus($this->print_status);
+    }
+
+    /** Whether non-admin users may set print status to Not required from the current status. */
+    public static function allowsNotRequiredFrom(?string $currentStatus): bool
+    {
+        return ! in_array($currentStatus, [
+            self::PRINT_STATUS_SENT_TO_PRINT,
+            self::PRINT_STATUS_PRINTED,
+        ], true);
+    }
+
+    public function hasEditDone(): bool
+    {
+        return $this->edit_done_at !== null;
+    }
+
+    public function workflowProfile(): string
+    {
+        return CategoryWorkflow::profileForCategoryName($this->category_name);
+    }
+
+    public function isDoneOnlyWorkflow(): bool
+    {
+        return $this->workflowProfile() === CategoryWorkflow::PROFILE_DONE_ONLY;
+    }
+
+    /** @deprecated Use isDoneOnlyWorkflow() */
+    public function isFramingOnlyWorkflow(): bool
+    {
+        return $this->isDoneOnlyWorkflow();
+    }
+
+    public function isPrintOnlyWorkflow(): bool
+    {
+        return $this->workflowProfile() === CategoryWorkflow::PROFILE_PRINT_ONLY;
+    }
+
+    public function isEditPrintWorkflow(): bool
+    {
+        return $this->workflowProfile() === CategoryWorkflow::PROFILE_EDIT_PRINT;
+    }
+
+    public function needsEditWorkflow(): bool
+    {
+        return $this->isEditPrintWorkflow();
+    }
+
+    public function needsPrintWorkflow(): bool
+    {
+        return $this->isEditPrintWorkflow() || $this->isPrintOnlyWorkflow();
+    }
+
+    public function needsDoneWorkflow(): bool
+    {
+        return $this->isDoneOnlyWorkflow();
+    }
+
+    /** @deprecated Use needsDoneWorkflow() */
+    public function needsFramingWorkflow(): bool
+    {
+        return $this->needsDoneWorkflow();
+    }
+
+    /** @deprecated Use isDoneOnlyWorkflow() */
     public function isFrameCategoryLine(): bool
     {
-        return strcasecmp(trim((string) $this->category_name), 'FRAME') === 0;
+        return $this->isDoneOnlyWorkflow();
     }
 
     /**
@@ -106,8 +182,15 @@ class JobEdit extends Model
     /** Whether this line satisfies its workflow for overall job completion. */
     public function isWorkflowCompleteForJob(): bool
     {
-        if ($this->isFrameCategoryLine()) {
+        if ($this->isDoneOnlyWorkflow()) {
             return $this->framing_done_at !== null;
+        }
+
+        if ($this->isPrintOnlyWorkflow()) {
+            return in_array($this->print_status, [
+                self::PRINT_STATUS_PRINTED,
+                self::PRINT_STATUS_NOT_REQUIRED,
+            ], true);
         }
 
         return $this->edit_done_at !== null
@@ -135,22 +218,17 @@ class JobEdit extends Model
             return 'Out of workflow (blocked)';
         }
 
-        if ($this->isFrameCategoryLine()) {
-            return $this->framing_done_at !== null ? 'Framing done' : 'Awaiting framing';
+        if ($this->isDoneOnlyWorkflow()) {
+            return $this->framing_done_at !== null ? 'Done' : 'Pending';
+        }
+
+        if ($this->isPrintOnlyWorkflow()) {
+            return 'Print: ' . $this->printStatusLabel();
         }
 
         $chunks = [];
         $chunks[] = $this->edit_done_at !== null ? 'Edit done' : 'Edit pending';
         $chunks[] = 'Print: ' . $this->printStatusLabel();
-
-        $printTerminal = in_array($this->print_status, [
-            self::PRINT_STATUS_PRINTED,
-            self::PRINT_STATUS_NOT_REQUIRED,
-        ], true);
-
-        if ($printTerminal) {
-            $chunks[] = $this->framing_done_at !== null ? 'Framing done' : 'Await framing';
-        }
 
         return implode(' · ', $chunks);
     }

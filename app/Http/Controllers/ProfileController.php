@@ -11,9 +11,12 @@ use Illuminate\View\View;
 
 class ProfileController extends Controller
 {
-    public function show(Request $request): View
+    public function show(Request $request): View|RedirectResponse
     {
         $user = $request->user();
+        if ($user->usesJobsAndJobPoolNavOnly()) {
+            return redirect()->route('jobs.index');
+        }
         $user->load('editorCategories');
 
         return view('profile.show', compact('user'));

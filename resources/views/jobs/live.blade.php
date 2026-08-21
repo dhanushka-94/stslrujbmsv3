@@ -15,7 +15,7 @@
                         <span class="text-[var(--color-studio-primary)] dark:text-[var(--color-studio-accent)]">Job Pool</span>
                     </h1>
                     <p class="mt-2 max-w-2xl text-sm text-slate-600 dark:text-slate-300">
-                        Paid sales from the source database (including jobs already opened). Open a sale to create a job, or open an existing job to update print or framing.
+                        Paid sales from the source database (including jobs already opened). Open a sale to create a job, or open an existing job to work eligible line items for your role.
                     </p>
                 </div>
                 <a href="{{ route('jobs.index') }}" class="inline-flex shrink-0 items-center gap-2 self-start rounded-lg border border-[var(--color-studio-border)] bg-white/90 px-4 py-2.5 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-white dark:border-[var(--color-studio-dark-border)] dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700/90">
@@ -27,6 +27,9 @@
     </section>
 
     <form method="GET" class="mb-6 flex flex-col gap-3 rounded-xl border border-[var(--color-studio-border)] bg-[var(--color-studio-bg-card)] p-4 shadow-sm dark:border-[var(--color-studio-dark-border)] dark:bg-[var(--color-studio-dark-card)] sm:flex-row sm:flex-wrap sm:items-end sm:gap-4">
+        @if(filled($categoryFilter ?? null))
+            <input type="hidden" name="category" value="{{ $categoryFilter }}">
+        @endif
         <div class="min-w-0 flex-1 sm:max-w-xs">
             <label for="live-filter-ref" class="mb-1.5 block text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Reference</label>
             <div class="relative">
@@ -42,28 +45,38 @@
                 @include('components.icons', ['name' => 'magnifying-glass', 'class' => 'w-4 h-4'])
                 Apply filter
             </button>
-            @if(filled($ref ?? null))
+            @if(filled($ref ?? null) || filled($categoryFilter ?? null))
                 <a href="{{ route('jobs.live') }}" class="inline-flex items-center rounded-lg border border-[var(--color-studio-border)] bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:bg-slate-50 dark:border-[var(--color-studio-dark-border)] dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700/80">Clear</a>
             @endif
         </div>
     </form>
 
+    <div class="mb-4 rounded-xl border border-[var(--color-studio-border)] bg-[var(--color-studio-bg-card)] px-4 py-3 shadow-sm dark:border-[var(--color-studio-dark-border)] dark:bg-[var(--color-studio-dark-card)]">
+        <x-workflow-legend
+            :active-category="$categoryFilter ?? null"
+            filter-route="jobs.live"
+            :filter-params="['ref' => $ref ?? null]"
+        />
+    </div>
+
     <div class="overflow-hidden rounded-xl border border-[var(--color-studio-border)] bg-[var(--color-studio-bg-card)] shadow-sm dark:border-[var(--color-studio-dark-border)] dark:bg-[var(--color-studio-dark-card)]">
         <div class="overflow-x-auto">
         <table class="w-full table-fixed text-sm">
             <colgroup>
-                <col class="w-[11%]">
-                <col class="w-[14%]">
-                <col class="w-[30%]">
-                <col class="w-[15%]">
                 <col class="w-[10%]">
-                <col class="w-[10%]">
-                <col class="w-[10%]">
+                <col class="w-[12%]">
+                <col class="w-[12%]">
+                <col class="w-[26%]">
+                <col class="w-[13%]">
+                <col class="w-[9%]">
+                <col class="w-[9%]">
+                <col class="w-[9%]">
             </colgroup>
             <thead class="border-b border-[var(--color-studio-border)] bg-slate-50/95 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-[var(--color-studio-dark-border)] dark:bg-slate-800/70 dark:text-slate-400">
             <tr>
                 <th class="p-3 align-top">Ref</th>
-                <th class="text-left p-3 align-top">Sale date (POS)</th>
+                <th class="text-left p-3 align-top">Bill created / updated</th>
+                <th class="text-left p-3 align-top">Staff note</th>
                 <th class="text-left p-3 align-top">Job items (from POS)</th>
                 <th class="text-left p-3 align-top">Due date (POS)</th>
                 <th class="text-left p-3 align-top">Due status</th>
@@ -77,6 +90,14 @@
                     $tz = config('app.timezone');
                     $job = $jobsBySourceId[(string) $sale->id] ?? null;
                     $items = $itemsBySaleId[$sale->id] ?? [];
+                    $canJoinAsAdditionalEditor = false;
+                    if ($job && auth()->user()->canTakeJob()) {
+                        $isAlreadyOnJob = auth()->user()->isAssignedToStudioJob($job);
+                        $editableLineCount = $job->edits->filter(fn ($edit) => $edit->needsEditWorkflow())->count();
+                        $canJoinAsAdditionalEditor = ! $isAlreadyOnJob
+                            && $editableLineCount > 1
+                            && in_array($job->status, [\App\Models\Job::STATUS_NEW, \App\Models\Job::STATUS_ASSIGNED, \App\Models\Job::STATUS_IN_PROGRESS], true);
+                    }
                     $dueAt = \App\Models\Job::resolveDueFromStoredAndPos(
                         $job?->due_date,
                         $sale->due_date ?? null
@@ -91,30 +112,67 @@
                             $saleAt = null;
                         }
                     }
+                    $saleEditedAt = null;
+                    $updatedRaw = $sale->updated_at ?? null;
+                    if (! empty($updatedRaw) && (string) $updatedRaw !== '0000-00-00 00:00:00') {
+                        try {
+                            $saleEditedAt = \Illuminate\Support\Carbon::parse($updatedRaw)->timezone($tz);
+                        } catch (\Throwable) {
+                            $saleEditedAt = null;
+                        }
+                    }
                 @endphp
                 <tr class="{{ $isOverdue ? 'bg-rose-50/60 dark:bg-rose-900/20 border-l-4 border-l-rose-500 dark:border-l-rose-400' : 'bg-white dark:bg-slate-900' }}">
                     <td class="p-3 align-top font-mono break-all">{{ $sale->reference_no }}</td>
-                    <td class="p-3 align-top">
+                    <td class="p-3 align-top text-xs leading-snug">
+                        <span class="block text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Created</span>
                         @if($saleAt)
-                            {{ $saleAt->format('M d, Y h:i A') }}
+                            <span class="tabular-nums text-slate-800 dark:text-slate-100">{{ $saleAt->format('M d, Y h:i A') }}</span>
                         @else
-                            —
+                            <span class="text-slate-400">—</span>
+                        @endif
+                        <span class="mt-1.5 block text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Updated</span>
+                        @if($saleEditedAt)
+                            <span class="tabular-nums text-slate-800 dark:text-slate-100">{{ $saleEditedAt->format('M d, Y h:i A') }}</span>
+                        @else
+                            <span class="text-slate-400">—</span>
+                        @endif
+                    </td>
+                    <td class="p-3 align-top min-w-0">
+                        @php $poolStaffNote = \App\Models\Job::normalizePosStaffNote($sale->staff_note ?? null); @endphp
+                        @if(filled($poolStaffNote))
+                            <x-pos-staff-note :note="$poolStaffNote" compact />
+                        @else
+                            <span class="text-slate-400">—</span>
                         @endif
                     </td>
                     <td class="p-3 align-top min-w-0">
                         @if(!empty($items))
                             <div class="max-h-64 overflow-y-auto overflow-x-hidden rounded-md border border-slate-200/80 dark:border-slate-600 bg-slate-50/80 dark:bg-slate-800/40 p-2 shadow-inner">
-                                <ul class="space-y-2 text-xs text-slate-700 dark:text-slate-200 list-none m-0 p-0">
-                                @foreach($items as $idx => $name)
-                                    <li class="break-words leading-snug border-b border-slate-200/60 dark:border-slate-600/60 pb-2 last:border-0 last:pb-0">
-                                        <span class="text-slate-400 font-mono tabular-nums select-none">#{{ $idx + 1 }}</span>
-                                        <span class="block pl-0 mt-0.5">{{ $name }}</span>
-                                    </li>
+                                <ul class="m-0 list-none space-y-2 p-0">
+                                @foreach($items as $idx => $item)
+                                    @php
+                                        $line = is_array($item)
+                                            ? $item
+                                            : ['name' => (string) $item, 'category_name' => null, 'profile' => \App\Support\CategoryWorkflow::PROFILE_EDIT_PRINT];
+                                    @endphp
+                                    <x-workflow-line-item
+                                        :index="$idx + 1"
+                                        :name="$line['name']"
+                                        :category-name="$line['category_name'] ?? null"
+                                        :profile="$line['profile'] ?? null"
+                                        compact
+                                    />
                                 @endforeach
                                 </ul>
                             </div>
                         @else
                             <span class="text-xs text-slate-400">No items</span>
+                        @endif
+                        @if(auth()->user()?->canSeeFullJobItemNamesSummary() && !empty($allItemNamesBySaleId[$sale->id] ?? []))
+                            <div class="mt-2">
+                                <x-job-all-item-names :names="$allItemNamesBySaleId[$sale->id]" compact />
+                            </div>
                         @endif
                     </td>
                     <td class="p-3 align-top">
@@ -161,11 +219,27 @@
                     <td class="p-3 align-top">
                         <div class="flex flex-wrap items-start gap-2">
                             @if($job)
-                                <a href="{{ route('jobs.show', $job) }}"
-                                   class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-[var(--color-studio-primary)] text-white text-sm hover:opacity-90">
-                                    @include('components.icons', ['name' => 'eye', 'class' => 'w-4 h-4'])
-                                    Open job
-                                </a>
+                                @if($canJoinAsAdditionalEditor)
+                                    <form action="{{ route('jobs.from-source', $sale->id) }}" method="POST" class="inline">
+                                        @csrf
+                                        <button type="submit"
+                                                class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-green-600 text-white text-sm hover:bg-green-700">
+                                            @include('components.icons', ['name' => 'plus-circle', 'class' => 'w-4 h-4'])
+                                            Open &amp; join
+                                        </button>
+                                    </form>
+                                    <a href="{{ route('jobs.show', $job) }}"
+                                       class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded border border-[var(--color-studio-border)] bg-white text-slate-700 text-sm hover:bg-slate-50 dark:border-[var(--color-studio-dark-border)] dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700/80">
+                                        @include('components.icons', ['name' => 'eye', 'class' => 'w-4 h-4'])
+                                        View
+                                    </a>
+                                @else
+                                    <a href="{{ route('jobs.show', $job) }}"
+                                       class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-[var(--color-studio-primary)] text-white text-sm hover:opacity-90">
+                                        @include('components.icons', ['name' => 'eye', 'class' => 'w-4 h-4'])
+                                        Open job
+                                    </a>
+                                @endif
                             @elseif(auth()->user()->canOpenJobFromPool())
                                 <form action="{{ route('jobs.from-source', $sale->id) }}" method="POST" class="inline">
                                     @csrf
@@ -183,7 +257,7 @@
                 </tr>
             @empty
                 <tr>
-                    <td colspan="7" class="px-6 py-14 text-center">
+                    <td colspan="8" class="px-6 py-14 text-center">
                         <div class="mx-auto inline-flex max-w-md flex-col items-center rounded-xl border border-dashed border-[var(--color-studio-border)] bg-slate-50/60 px-6 py-8 dark:border-[var(--color-studio-dark-border)] dark:bg-slate-800/30">
                             @include('components.icons', ['name' => 'folder', 'class' => 'h-10 w-10 text-slate-400 dark:text-slate-500'])
                             <p class="mt-3 text-sm font-medium text-slate-600 dark:text-slate-300">

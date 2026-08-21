@@ -7,14 +7,15 @@
     <title>@yield('title', config('app.name'))</title>
     <link rel="preconnect" href="https://fonts.bunny.net">
     <link href="https://fonts.bunny.net/css?family=instrument-sans:400,500,600" rel="stylesheet" />
-    @vite(['resources/css/app.css', 'resources/js/app.js'])
+    <x-vite-assets />
 </head>
 <body class="bg-[var(--color-studio-bg)] min-h-screen text-slate-800 dark:text-slate-100 flex flex-col">
+    <x-app-loading-screen />
     {{-- Sticky site header: brand strip + main nav (stays visible while scrolling) --}}
     <div class="sticky top-0 z-40 border-b border-slate-200/90 bg-[var(--color-studio-bg)]/85 shadow-[0_8px_30px_-12px_rgba(15,23,42,0.12)] backdrop-blur-md dark:border-slate-700/80 dark:bg-slate-950/80 dark:shadow-[0_12px_40px_-16px_rgba(0,0,0,0.45)]">
         <header class="border-b border-slate-200/70 bg-gradient-to-r from-white/90 via-slate-50/80 to-white/90 dark:border-slate-700/60 dark:from-slate-900/90 dark:via-slate-900/70 dark:to-slate-900/90">
             <div class="mx-auto flex w-full max-w-none items-center justify-between gap-3 px-4 py-2 sm:px-6 lg:px-8">
-                <a href="{{ route('dashboard') }}" class="inline-flex min-w-0 items-center gap-2.5 rounded-lg py-0.5 font-semibold text-[var(--color-studio-primary)] ring-[var(--color-studio-primary)]/15 transition hover:opacity-90 focus:outline-none focus-visible:ring-2 dark:text-[var(--color-studio-accent)] dark:ring-[var(--color-studio-accent)]/20">
+                <a href="{{ auth()->check() ? route(auth()->user()->homeRouteName()) : route('login') }}" class="inline-flex min-w-0 items-center gap-2.5 rounded-lg py-0.5 font-semibold text-[var(--color-studio-primary)] ring-[var(--color-studio-primary)]/15 transition hover:opacity-90 focus:outline-none focus-visible:ring-2 dark:text-[var(--color-studio-accent)] dark:ring-[var(--color-studio-accent)]/20">
                     <span class="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white shadow-sm ring-1 ring-slate-200/80 dark:bg-slate-800 dark:ring-slate-600">
                         <img src="{{ asset('studio_salaru_logo.jpg') }}" alt="{{ config('app.name') }}" class="h-7 w-auto max-h-full max-w-full object-contain" />
                     </span>
@@ -30,27 +31,36 @@
             <div class="mx-auto flex w-full max-w-none items-center justify-between gap-2 px-4 py-2.5 sm:gap-4 sm:px-6 lg:px-8">
             @auth
                 <div class="flex flex-wrap items-center gap-1.5 min-w-0 flex-1">
+                    @unless(auth()->user()->usesJobsAndJobPoolNavOnly())
                     <a href="{{ route('dashboard') }}" class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded-full whitespace-nowrap transition-colors
                         {{ request()->routeIs('dashboard') ? 'bg-[var(--color-studio-primary)] text-white shadow-sm' : 'text-slate-600 dark:text-slate-400 hover:text-[var(--color-studio-primary)] hover:bg-slate-100 dark:hover:bg-slate-700' }}">
                         @include('components.icons', ['name' => 'dashboard', 'class' => 'w-4 h-4'])
                         Dashboard
                     </a>
+                    @endunless
                     <a href="{{ route('jobs.index') }}" class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded-full whitespace-nowrap transition-colors
                         {{ request()->routeIs('jobs.index','jobs.show') ? 'bg-[var(--color-studio-primary)] text-white shadow-sm' : 'text-slate-600 dark:text-slate-400 hover:text-[var(--color-studio-primary)] hover:bg-slate-100 dark:hover:bg-slate-700' }}">
                         @include('components.icons', ['name' => 'briefcase', 'class' => 'w-4 h-4'])
                         Jobs
+                        <span id="pos-updated-nav-badge" @class([
+                            'ml-0.5 inline-flex items-center justify-center rounded-full bg-orange-600 text-white text-[10px] min-w-[16px] h-4 px-1',
+                            'hidden' => (int) ($posUpdatedNavCount ?? 0) < 1,
+                        ]) aria-label="POS bills updated">{{ (int) ($posUpdatedNavCount ?? 0) > 9 ? '9+' : (int) ($posUpdatedNavCount ?? 0) }}</span>
                     </a>
-                    <a href="{{ route('jobs.live') }}" class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded-full whitespace-nowrap transition-colors
-                        {{ request()->routeIs('jobs.live') ? 'bg-[var(--color-studio-primary)] text-white shadow-sm' : 'text-slate-600 dark:text-slate-400 hover:text-[var(--color-studio-primary)] hover:bg-slate-100 dark:hover:bg-slate-700' }}"
-                        @if(filled($jobPoolNotifyTitle ?? null)) title="{{ $jobPoolNotifyTitle }}" @endif>
-                        @include('components.icons', ['name' => 'bolt', 'class' => 'w-4 h-4'])
-                        Job Pool
-                        @if(isset($jobPoolNewCount) && $jobPoolNewCount > 0)
-                            <span class="ml-1 inline-flex items-center justify-center rounded-full bg-red-600 text-white text-[10px] min-w-[16px] h-4 px-1" aria-label="{{ $jobPoolNotifyTitle ?? 'New Job Pool items' }}">
-                                {{ $jobPoolNewCount > 9 ? '9+' : $jobPoolNewCount }}
-                            </span>
-                        @endif
-                    </a>
+                    @if(auth()->user()->canAccessJobPool())
+                        <a href="{{ route('jobs.live') }}" class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded-full whitespace-nowrap transition-colors
+                            {{ request()->routeIs('jobs.live') ? 'bg-[var(--color-studio-primary)] text-white shadow-sm' : 'text-slate-600 dark:text-slate-400 hover:text-[var(--color-studio-primary)] hover:bg-slate-100 dark:hover:bg-slate-700' }}"
+                            @if(filled($jobPoolNotifyTitle ?? null)) title="{{ $jobPoolNotifyTitle }}" @endif>
+                            @include('components.icons', ['name' => 'bolt', 'class' => 'w-4 h-4'])
+                            Job Pool
+                            @if(isset($jobPoolNewCount) && $jobPoolNewCount > 0)
+                                <span class="ml-1 inline-flex items-center justify-center rounded-full bg-red-600 text-white text-[10px] min-w-[16px] h-4 px-1" aria-label="{{ $jobPoolNotifyTitle ?? 'New Job Pool items' }}">
+                                    {{ $jobPoolNewCount > 9 ? '9+' : $jobPoolNewCount }}
+                                </span>
+                            @endif
+                        </a>
+                    @endif
+                    @unless(auth()->user()->usesJobsAndJobPoolNavOnly())
                     <a href="{{ route('profile.show') }}" class="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded-full whitespace-nowrap transition-colors
                         {{ request()->routeIs('profile.*') ? 'bg-[var(--color-studio-primary)]/10 text-[var(--color-studio-primary)] dark:bg-[var(--color-studio-accent)]/10 dark:text-[var(--color-studio-accent)]' : 'text-slate-600 dark:text-slate-400 hover:text-[var(--color-studio-primary)] hover:bg-slate-100 dark:hover:bg-slate-700' }}">
                         @include('components.icons', ['name' => 'users', 'class' => 'w-4 h-4'])
@@ -61,6 +71,7 @@
                         @include('components.icons', ['name' => 'document-check', 'class' => 'w-4 h-4'])
                         Reports
                     </a>
+                    @endunless
                     {{-- Settings dropdown: Catalog, Blocking, Administration (Admin only) --}}
                     @if(auth()->user()->isAdmin())
                         <div class="relative z-40 group">
@@ -147,6 +158,7 @@
             </p>
         </div>
     </footer>
+    @stack('scripts')
     <script>
         (function () {
             var el = document.getElementById('live-datetime');
@@ -159,5 +171,44 @@
             setInterval(update, 1000);
         })();
     </script>
+    @auth
+        @php
+            $__posBadgeSections = auth()->user()->allowedJobsListSections();
+            $__showPosBadgeRefresh = $__posBadgeSections === null || in_array('pos_updated', $__posBadgeSections, true);
+        @endphp
+        @if($__showPosBadgeRefresh)
+            <script>
+                (function () {
+                    var url = @json(route('jobs.pos-updated-count'));
+                    function applyCount(count) {
+                        count = parseInt(count, 10) || 0;
+                        var label = count > 9 ? '9+' : String(count);
+                        var nav = document.getElementById('pos-updated-nav-badge');
+                        if (nav) {
+                            nav.textContent = label;
+                            nav.classList.toggle('hidden', count < 1);
+                        }
+                        var tab = document.getElementById('pos-updated-tab-count');
+                        if (tab) tab.textContent = String(count);
+                        var banner = document.getElementById('pos-updated-banner');
+                        var bannerCount = document.getElementById('pos-updated-banner-count');
+                        if (bannerCount) bannerCount.textContent = String(count);
+                        if (banner) banner.classList.toggle('hidden', count < 1);
+                    }
+                    function refresh() {
+                        fetch(url, { headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }, credentials: 'same-origin' })
+                            .then(function (r) { return r.ok ? r.json() : null; })
+                            .then(function (data) { if (data && typeof data.count !== 'undefined') applyCount(data.count); })
+                            .catch(function () {});
+                    }
+                    if ('requestIdleCallback' in window) {
+                        requestIdleCallback(refresh, { timeout: 2500 });
+                    } else {
+                        setTimeout(refresh, 800);
+                    }
+                })();
+            </script>
+        @endif
+    @endauth
 </body>
 </html>

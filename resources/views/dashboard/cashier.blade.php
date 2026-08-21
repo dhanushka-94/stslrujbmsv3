@@ -65,7 +65,6 @@
                     <div class="min-w-0">
                         <div class="flex flex-wrap items-baseline gap-x-2 gap-y-1">
                             <span class="font-mono text-base font-semibold text-slate-900 dark:text-slate-100">{{ $job->ref_number }}</span>
-                            <span class="text-sm text-slate-500 dark:text-slate-400">{{ $job->customer_name ?? '—' }}</span>
                         </div>
                         <p class="mt-1.5 text-xs text-slate-500 dark:text-slate-400">
                             Editor: <span class="font-medium text-slate-600 dark:text-slate-300">{{ $job->editor?->name ?? '—' }}</span>

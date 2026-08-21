@@ -7,9 +7,10 @@
     <title>Login – {{ config('app.name') }}</title>
     <link rel="preconnect" href="https://fonts.bunny.net">
     <link href="https://fonts.bunny.net/css?family=instrument-sans:400,500,600" rel="stylesheet" />
-    @vite(['resources/css/app.css', 'resources/js/app.js'])
+    <x-vite-assets />
 </head>
 <body class="bg-[var(--color-studio-bg)] min-h-screen flex items-center justify-center p-4">
+    <x-app-loading-screen />
     <div class="w-full max-w-md bg-[var(--color-studio-bg-card)] dark:bg-[var(--color-studio-dark-card)] rounded-xl shadow-lg border border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] p-8">
         <div class="flex justify-center mb-4">
             <img src="{{ asset('studio_salaru_logo.jpg') }}" alt="{{ config('app.name') }}" class="h-14 w-auto object-contain" />

@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Support\CategoryWorkflow;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
@@ -68,7 +69,7 @@ class Job extends Model
     ];
 
     /** First calendar day of POS `sma_sales.date` included in Job Pool (app timezone applied when querying). */
-    public const SOURCE_JOB_POOL_MIN_SALE_DATE = '2026-05-01';
+    public const SOURCE_JOB_POOL_MIN_SALE_DATE = '2026-08-01';
 
     public const DELIVERY_ONLINE = 'online';
     public const DELIVERY_WALKIN = 'walkin';
@@ -77,6 +78,11 @@ class Job extends Model
     public function edits(): HasMany
     {
         return $this->hasMany(JobEdit::class, 'studio_job_id')->orderBy('sort_order');
+    }
+
+    public function posApplyHistories(): HasMany
+    {
+        return $this->hasMany(JobPosApplyHistory::class, 'studio_job_id')->orderByDesc('applied_at');
     }
 
     public function editor(): BelongsTo
@@ -165,6 +171,17 @@ class Job extends Model
         return null;
     }
 
+    /** Trim POS `sma_sales.staff_note`; empty strings become null. */
+    public static function normalizePosStaffNote(mixed $raw): ?string
+    {
+        if ($raw === null || $raw === '') {
+            return null;
+        }
+        $s = trim((string) $raw);
+
+        return $s !== '' ? $s : null;
+    }
+
     /**
      * Overdue when due is in the past. Date-only dues (midnight) count overdue from the start of the next calendar day.
      */
@@ -239,8 +256,12 @@ class Job extends Model
             if ($e->isWorkflowCompleteForJob()) {
                 continue;
             }
-            if ($e->isFrameCategoryLine()) {
+            if ($e->isDoneOnlyWorkflow()) {
                 $pendingFraming++;
+            } elseif ($e->isPrintOnlyWorkflow()) {
+                if (! in_array($e->print_status, [JobEdit::PRINT_STATUS_PRINTED, JobEdit::PRINT_STATUS_NOT_REQUIRED], true)) {
+                    $pendingPhotoPrint++;
+                }
             } elseif ($e->edit_done_at === null) {
                 $pendingPhotoEdit++;
             } else {
@@ -274,8 +295,11 @@ class Job extends Model
         return static::query()
             ->whereNotNull('source_id')
             ->where('status', '!=', self::STATUS_DELIVERED)
-            ->whereHas('edits', function ($ed) use ($blockedCats, $blockedProds) {
+            ->whereHas('edits', function ($ed) use ($blockedCats, $blockedProds, $user) {
                 self::applyBlockedCatalogToJobEditQuery($ed, $blockedCats, $blockedProds);
+                if ($user->jobPoolShowsPrintQueue() || $user->jobPoolShowsFramingQueue()) {
+                    CategoryWorkflow::scopeJobPoolCategoriesForUser($ed, $user, 'category_name');
+                }
             });
     }
 
@@ -328,24 +352,62 @@ class Job extends Model
 
     public static function orderJobPoolByPosDueDate(Builder $jobQuery): Builder
     {
+        $table = $jobQuery->getModel()->getTable();
         $sourceDb = config('database.connections.source.database');
-        if (empty($sourceDb)) {
+
+        if (empty($sourceDb) || ! self::sourceDatabaseIsSameMysqlServer()) {
             return $jobQuery
-                ->orderBy('studio_jobs.due_date')
-                ->orderBy('studio_jobs.created_at');
+                ->orderBy($table.'.due_date')
+                ->orderBy($table.'.created_at')
+                ->orderBy($table.'.id');
         }
+
+        // Same MySQL server only: `other_db.table` works. Different hosts / missing grants → Jobs 500.
+        $sourceDb = str_replace('`', '``', (string) $sourceDb);
 
         return $jobQuery
             ->orderByRaw(
                 'COALESCE('
-                .'(SELECT sp.due_date FROM `'.$sourceDb.'`.sma_sales sp WHERE sp.id = CAST(studio_jobs.source_id AS UNSIGNED) LIMIT 1),'
-                .'studio_jobs.due_date)'
+                .'(SELECT sp.due_date FROM `'.$sourceDb.'`.sma_sales sp WHERE sp.id = CAST('.$table.'.source_id AS UNSIGNED) LIMIT 1),'
+                .$table.'.due_date)'
             )
             ->orderByRaw(
                 'COALESCE('
-                .'(SELECT sp2.`date` FROM `'.$sourceDb.'`.sma_sales sp2 WHERE sp2.id = CAST(studio_jobs.source_id AS UNSIGNED) LIMIT 1),'
-                .'studio_jobs.created_at)'
-            );
+                .'(SELECT sp2.`date` FROM `'.$sourceDb.'`.sma_sales sp2 WHERE sp2.id = CAST('.$table.'.source_id AS UNSIGNED) LIMIT 1),'
+                .$table.'.created_at)'
+            )
+            ->orderBy($table.'.id');
+    }
+
+    /** True when app DB and POS source DB are on the same MySQL host/port (required for cross-db ORDER BY). */
+    public static function sourceDatabaseIsSameMysqlServer(): bool
+    {
+        $default = config('database.connections.'.config('database.default', 'mysql'), []);
+        $source = config('database.connections.source', []);
+        if (! is_array($default) || ! is_array($source)) {
+            return false;
+        }
+
+        $defaultHost = self::normalizeMysqlHost((string) ($default['host'] ?? ''));
+        $sourceHost = self::normalizeMysqlHost((string) ($source['host'] ?? ''));
+        $defaultPort = (string) ($default['port'] ?? '3306');
+        $sourcePort = (string) ($source['port'] ?? '3306');
+
+        if ($defaultHost === '' || $sourceHost === '') {
+            return false;
+        }
+
+        return $defaultHost === $sourceHost && $defaultPort === $sourcePort;
+    }
+
+    private static function normalizeMysqlHost(string $host): string
+    {
+        $host = strtolower(trim($host));
+        if ($host === 'localhost' || $host === '::1') {
+            return '127.0.0.1';
+        }
+
+        return $host;
     }
 
     /**
@@ -353,9 +415,15 @@ class Job extends Model
      */
     protected static function constrainJobEditScopeForPrintQueue(Builder $ed, array $blockedCats, array $blockedProds): void
     {
-        $ed->whereNotNull('edit_done_at')
-            ->whereIn('print_status', [JobEdit::PRINT_STATUS_PENDING, JobEdit::PRINT_STATUS_SENT_TO_PRINT])
-            ->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) <> ?', ['FRAME']);
+        $ed->whereIn('print_status', [JobEdit::PRINT_STATUS_PENDING, JobEdit::PRINT_STATUS_SENT_TO_PRINT])
+            ->where(function (Builder $printLines) {
+                $printLines->where(function (Builder $printOnly) {
+                    CategoryWorkflow::scopePrintOnlyCategory($printOnly);
+                })->orWhere(function (Builder $editPrint) {
+                    CategoryWorkflow::scopeEditPrintCategory($editPrint);
+                    $editPrint->whereNotNull('edit_done_at');
+                });
+            });
 
         if ($blockedCats !== []) {
             $ed->where(function ($qq) use ($blockedCats) {
@@ -370,15 +438,14 @@ class Job extends Model
     }
 
     /**
-     * Framing Job Pool: (1) FRAME category lines still needing framing, or (2) non-frame lines that are printed
-     * (or print not required) and still need framing. Uses IFNULL(category_name) so NULL POS category rows are not dropped.
-     * When the user has allowed POS categories, lines with null source_category_id still match (name-only frame / printed photo).
+     * Framing queue: framing-only POS categories with framing not yet done.
      *
      * @param  Builder<\App\Models\JobEdit>  $ed
      */
     protected static function constrainJobEditScopeForFramingQueue(Builder $ed, array $blockedCats, array $blockedProds, User $user): void
     {
         $ed->whereNull('framing_done_at');
+        CategoryWorkflow::scopeDoneOnlyCategory($ed);
 
         if ($blockedCats !== []) {
             $ed->where(function ($qq) use ($blockedCats) {
@@ -392,27 +459,11 @@ class Job extends Model
         }
 
         $allowed = $user->assignedCategoryIds();
-        $printedTerminal = [JobEdit::PRINT_STATUS_PRINTED, JobEdit::PRINT_STATUS_NOT_REQUIRED];
-
-        $ed->where(function ($w) use ($allowed, $printedTerminal) {
-            $w->where(function ($frameOnly) use ($allowed) {
-                $frameOnly->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) = ?', ['FRAME']);
-                if ($allowed !== []) {
-                    $frameOnly->where(function ($cat) use ($allowed) {
-                        $cat->whereNull('source_category_id')
-                            ->orWhereIn('source_category_id', $allowed);
-                    });
-                }
-            })->orWhere(function ($afterPrint) use ($allowed, $printedTerminal) {
-                $afterPrint->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) <> ?', ['FRAME'])
-                    ->whereIn('print_status', $printedTerminal);
-                if ($allowed !== []) {
-                    $afterPrint->where(function ($cat) use ($allowed) {
-                        $cat->whereNull('source_category_id')
-                            ->orWhereIn('source_category_id', $allowed);
-                    });
-                }
+        if ($allowed !== []) {
+            $ed->where(function ($cat) use ($allowed) {
+                $cat->whereNull('source_category_id')
+                    ->orWhereIn('source_category_id', $allowed);
             });
-        });
+        }
     }
 }

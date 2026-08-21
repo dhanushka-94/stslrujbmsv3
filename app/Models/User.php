@@ -3,6 +3,8 @@
 namespace App\Models;
 
 // use Illuminate\Contracts\Auth\MustVerifyEmail;
+use App\Models\Job;
+use App\Support\CategoryWorkflow;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
@@ -55,16 +57,19 @@ class User extends Authenticatable
         self::ROLE_DELIVERY => 'Delivery',
     ];
 
-    /** Roles that can have POS category restrictions for job items. */
+    /** Whether this role may have allowed POS categories assigned (all roles except Admin). */
+    public static function roleMayHaveCategoryAssignments(?string $role): bool
+    {
+        return $role !== null && $role !== self::ROLE_ADMIN;
+    }
+
+    /** Roles that can have POS category restrictions (every role except Admin). */
     public static function rolesWithCategoryAssignments(): array
     {
-        return [
-            self::ROLE_EDITOR,
-            self::ROLE_EDITOR_PRINTER,
-            self::ROLE_EDITOR_PRINTER_FRAMING,
-            self::ROLE_FRAMING,
-            self::ROLE_PRINTER_FRAMING,
-        ];
+        return array_values(array_filter(
+            array_keys(self::ROLES),
+            fn (string $role) => self::roleMayHaveCategoryAssignments($role)
+        ));
     }
 
     protected $fillable = [
@@ -127,39 +132,70 @@ class User extends Authenticatable
         return $this->editorCategories->pluck('source_category_id')->map(fn ($id) => (int) $id)->values()->all();
     }
 
-    /**
-     * Photo-editing workflow on a line (claim, edit status, customer steps, edit done): editors only.
-     * Admin/Manager: all non-FRAME lines. Printers / dedicated framers use print & framing actions only.
-     */
-    public function canEditJobItem(JobEdit $edit): bool
+    public function isAssignedToStudioJob(?Job $job): bool
     {
-        if (in_array($this->role, [self::ROLE_ADMIN, self::ROLE_MANAGER], true)) {
-            return true;
-        }
-        if ($edit->isFrameCategoryLine()) {
-            return false;
-        }
-        if (! $this->isEditor()) {
-            return false;
-        }
-        $job = $edit->job ?? \App\Models\Job::find($edit->studio_job_id);
         if (! $job) {
             return false;
         }
         $job->loadMissing('editors');
-        $isAssignedToJob = $job->assigned_editor_id === $this->id || $job->editors->contains('id', $this->id);
-        if (! $isAssignedToJob) {
+
+        return $job->assigned_editor_id === $this->id
+            || $job->editors->contains('id', $this->id);
+    }
+
+    public function categoryAllowsJobLine(JobEdit $edit): bool
+    {
+        $allowed = $this->scopedCategoryIdsForJobLineTable();
+        if ($allowed === []) {
+            return true;
+        }
+        $catId = $edit->source_category_id ? (int) $edit->source_category_id : null;
+        if ($catId === null) {
+            return true;
+        }
+
+        return in_array($catId, $allowed, true);
+    }
+
+    /**
+     * Assigned to the job and allowed category (edit/print/done lines on that job).
+     */
+    public function canWorkOnAssignedJobLine(JobEdit $edit): bool
+    {
+        if (! $this->isEditor()) {
             return false;
         }
-        $allowedIds = $this->assignedCategoryIds();
-        if (empty($allowedIds)) {
+        $job = $edit->job ?? \App\Models\Job::find($edit->studio_job_id);
+        if (! $this->isAssignedToStudioJob($job)) {
+            return false;
+        }
+
+        if ($this->seesEditAndPrintLinesRegardlessOfCategoryAllowlist()
+            && ($edit->needsEditWorkflow() || $edit->isPrintOnlyWorkflow())) {
             return true;
         }
-        $itemCategoryId = $edit->source_category_id ? (int) $edit->source_category_id : null;
-        if ($itemCategoryId === null) {
-            return true;
+
+        return $this->categoryAllowsJobLine($edit);
+    }
+
+    /**
+     * Photo-editing workflow on a line (claim, edit status, customer steps, edit done): editors only.
+     * Admin/Manager: edit/print lines only. Printers use print actions; framers use Done.
+     */
+    public function canEditJobItem(JobEdit $edit): bool
+    {
+        if (! $this->canModifyJobWorkflow()) {
+            return false;
         }
-        return in_array($itemCategoryId, $allowedIds, true);
+
+        if (in_array($this->role, [self::ROLE_ADMIN, self::ROLE_MANAGER], true)) {
+            return $edit->needsEditWorkflow();
+        }
+        if (! $edit->needsEditWorkflow()) {
+            return false;
+        }
+
+        return $this->canWorkOnAssignedJobLine($edit);
     }
 
     /**
@@ -190,6 +226,40 @@ class User extends Authenticatable
         return in_array($this->role, [self::ROLE_EDITOR, self::ROLE_EDITOR_PRINTER, self::ROLE_EDITOR_PRINTER_FRAMING], true);
     }
 
+    /** Editor, Editor + Printer, or Editor + Printer + Framing — may open the time report for themselves only. */
+    public function canViewOwnEditorTimeReport(): bool
+    {
+        return $this->isEditor();
+    }
+
+    /** Time report page: own data (editor roles) or all editors (admin/manager). */
+    public function canViewEditorTimeReport(): bool
+    {
+        return $this->canViewAllEditorsTimeReport() || $this->canViewOwnEditorTimeReport();
+    }
+
+    /** All editors, filters, and cross-user totals — admin and manager only. */
+    public function canViewAllEditorsTimeReport(): bool
+    {
+        return $this->isAdmin() || $this->isManager();
+    }
+
+    /** User reports list and another user's activity report — admin and manager only. */
+    public function canViewOtherUsersReports(): bool
+    {
+        return $this->isAdmin() || $this->isManager();
+    }
+
+    /** @return list<string> Roles included in the admin/manager editor time report. */
+    public static function rolesInEditorTimeReport(): array
+    {
+        return [
+            self::ROLE_EDITOR,
+            self::ROLE_EDITOR_PRINTER,
+            self::ROLE_EDITOR_PRINTER_FRAMING,
+        ];
+    }
+
     /** Editor or Framing (for POS category filters, legacy checks). Prefer isEditor() for photo-edit permissions. */
     public function isEditorOrFraming(): bool
     {
@@ -197,15 +267,15 @@ class User extends Authenticatable
     }
 
     /**
-     * Category restrictions for the job line table: editors + dedicated framers (not printer-only).
+     * Category restrictions for job lines, Job Pool, and reports. Admin has no limit; empty list = all categories.
      */
     public function scopedCategoryIdsForJobLineTable(): array
     {
-        if ($this->isEditor() || ($this->isFraming() && ! $this->isEditor())) {
-            return $this->assignedCategoryIds();
+        if ($this->isAdmin() || $this->isSalesViewOnly()) {
+            return [];
         }
 
-        return [];
+        return $this->assignedCategoryIds();
     }
 
     /** Users who may be attached to a job as photo editors (pivot job_editor). */
@@ -229,6 +299,134 @@ class User extends Authenticatable
         return in_array($this->role, [self::ROLE_EDITOR_PRINTER, self::ROLE_EDITOR_PRINTER_FRAMING], true);
     }
 
+    /** Editor + Printer only (not Editor + Printer + Framing). */
+    public function isEditorPrinterOnly(): bool
+    {
+        return $this->role === self::ROLE_EDITOR_PRINTER;
+    }
+
+    public function isEditorPrinterFraming(): bool
+    {
+        return $this->role === self::ROLE_EDITOR_PRINTER_FRAMING;
+    }
+
+    /**
+     * Editor + Printer + Framing always sees edit/print workflow lines; category allowlist only limits done-only lines.
+     */
+    public function seesEditAndPrintLinesRegardlessOfCategoryAllowlist(): bool
+    {
+        return $this->isEditorPrinterFraming();
+    }
+
+    /**
+     * Whether this user should see/work this line on job detail, jobs list, and bulk actions.
+     */
+    public function isJobLineVisibleToMe(JobEdit $edit): bool
+    {
+        if ($edit->isGloballyHiddenFromStudioWorkflow()) {
+            return false;
+        }
+
+        if ($this->isSalesViewOnly()) {
+            return true;
+        }
+
+        if ($this->isEditorPrinterOnly()) {
+            return $edit->needsEditWorkflow() || $edit->isPrintOnlyWorkflow();
+        }
+
+        if ($this->seesEditAndPrintLinesRegardlessOfCategoryAllowlist()
+            && ($edit->needsEditWorkflow() || $edit->isPrintOnlyWorkflow())) {
+            return true;
+        }
+
+        if ($this->isPrinter()) {
+            return $edit->needsPrintWorkflow()
+                && CategoryWorkflow::categoryMatchesUserJobPool($edit->category_name, $this)
+                && $this->categoryAllowsJobLine($edit);
+        }
+
+        if ($this->role === self::ROLE_FRAMING) {
+            return $edit->needsDoneWorkflow()
+                && CategoryWorkflow::categoryMatchesUserJobPool($edit->category_name, $this)
+                && $this->categoryAllowsJobLine($edit);
+        }
+
+        if ($this->role === self::ROLE_PRINTER_FRAMING) {
+            return CategoryWorkflow::categoryMatchesUserJobPool($edit->category_name, $this)
+                && $this->categoryAllowsJobLine($edit);
+        }
+
+        return $this->categoryAllowsJobLine($edit);
+    }
+
+    /**
+     * Job Pool / POS row visibility for a category name (before a studio job exists).
+     */
+    public function isPosCategoryVisibleToMe(?string $categoryName, ?int $sourceCategoryId = null): bool
+    {
+        if ($this->isSalesViewOnly()) {
+            return true;
+        }
+
+        if ($this->isEditorPrinterOnly()) {
+            $profile = CategoryWorkflow::profileForCategoryName($categoryName);
+
+            return in_array($profile, [
+                CategoryWorkflow::PROFILE_EDIT_PRINT,
+                CategoryWorkflow::PROFILE_PRINT_ONLY,
+            ], true);
+        }
+
+        if ($this->seesEditAndPrintLinesRegardlessOfCategoryAllowlist()) {
+            $profile = CategoryWorkflow::profileForCategoryName($categoryName);
+            if (in_array($profile, [
+                CategoryWorkflow::PROFILE_EDIT_PRINT,
+                CategoryWorkflow::PROFILE_PRINT_ONLY,
+            ], true)) {
+                return true;
+            }
+
+            return $this->categoryIdAllowedForPos($sourceCategoryId);
+        }
+
+        if ($this->jobPoolShowsPrintQueue() || $this->jobPoolShowsFramingQueue()) {
+            return CategoryWorkflow::categoryMatchesUserJobPool($categoryName, $this)
+                && $this->categoryIdAllowedForPos($sourceCategoryId);
+        }
+
+        return $this->categoryIdAllowedForPos($sourceCategoryId);
+    }
+
+    public function categoryIdAllowedForPos(?int $sourceCategoryId): bool
+    {
+        $allowed = $this->scopedCategoryIdsForJobLineTable();
+        if ($allowed === [] || $sourceCategoryId === null || $sourceCategoryId <= 0) {
+            return true;
+        }
+
+        return in_array($sourceCategoryId, $allowed, true);
+    }
+
+    /** Roles that see a read-only list of every line item name (Job Pool + job detail footer). */
+    public static function rolesWithFullJobItemNamesSummary(): array
+    {
+        return [
+            self::ROLE_ADMIN,
+            self::ROLE_EDITOR,
+            self::ROLE_EDITOR_PRINTER,
+            self::ROLE_EDITOR_PRINTER_FRAMING,
+            self::ROLE_PRINTER,
+            self::ROLE_PRINTER_FRAMING,
+        ];
+    }
+
+    /** Read-only full job line names (all edits), separate from per-line workflow visibility. */
+    public function canSeeFullJobItemNamesSummary(): bool
+    {
+        return in_array($this->role, self::rolesWithFullJobItemNamesSummary(), true);
+    }
+
     public function isPrinter(): bool
     {
         return $this->role === self::ROLE_PRINTER;
@@ -244,9 +442,85 @@ class User extends Authenticatable
         return $this->role === self::ROLE_SALES;
     }
 
+    /** Sales: view all line statuses; no edit, print, or Done actions — delivery only. */
+    public function isSalesViewOnly(): bool
+    {
+        return $this->isSales();
+    }
+
+    /** Job Pool page/nav (Delivery cannot; Sales can view). */
+    public function canAccessJobPool(): bool
+    {
+        return ! $this->isDeliveryViewOnly();
+    }
+
+    /** Sales nav: Jobs + Job Pool only (no Dashboard / Profile / Reports). */
+    public function usesJobsAndJobPoolNavOnly(): bool
+    {
+        return $this->isSales();
+    }
+
+    /** Default landing route after login / home. */
+    public function homeRouteName(): string
+    {
+        if ($this->usesJobsAndJobPoolNavOnly()) {
+            return 'jobs.index';
+        }
+
+        return 'dashboard';
+    }
+
+    /** Delivery: completed jobs only; mark delivered — no edit/print/Done. */
+    public function isDeliveryViewOnly(): bool
+    {
+        return $this->isDelivery();
+    }
+
+    /** Sales or Delivery counter staff — read-only on job workflow actions. */
+    public function isCounterStaffViewOnly(): bool
+    {
+        return $this->isSalesViewOnly() || $this->isDeliveryViewOnly();
+    }
+
+    public function canModifyJobWorkflow(): bool
+    {
+        return ! $this->isCounterStaffViewOnly();
+    }
+
     public function isDelivery(): bool
     {
         return $this->role === self::ROLE_DELIVERY;
+    }
+
+    /** Jobs list sections this role may open (null = all sections). */
+    public function allowedJobsListSections(): ?array
+    {
+        if ($this->isDeliveryViewOnly()) {
+            return ['completed'];
+        }
+
+        if ($this->isPrinter()) {
+            return ['ongoing', 'pos_updated', 'print_done', 'completed', 'delivered', 'dismissed'];
+        }
+
+        if ($this->role === self::ROLE_FRAMING) {
+            return ['ongoing', 'pos_updated', 'framing_done', 'completed', 'delivered', 'dismissed'];
+        }
+
+        if ($this->role === self::ROLE_PRINTER_FRAMING) {
+            return ['ongoing', 'pos_updated', 'print_done', 'framing_done', 'completed', 'delivered', 'dismissed'];
+        }
+
+        return null;
+    }
+
+    public function canViewJobDetail(Job $job): bool
+    {
+        if ($this->isDeliveryViewOnly()) {
+            return $job->status === Job::STATUS_COMPLETED;
+        }
+
+        return true;
     }
 
     /**
@@ -287,15 +561,49 @@ class User extends Authenticatable
         ], true);
     }
 
-    /** Only photo editors “take” jobs from New; printers/framers open work from Job Pool / jobs list. */
+    /** Framing and Printer + Framing: open from Job Pool but must take/join before line workflow actions. */
+    public function usesPoolTakeJobWorkflow(): bool
+    {
+        return in_array($this->role, [self::ROLE_FRAMING, self::ROLE_PRINTER_FRAMING], true);
+    }
+
+    /** Photo editors take new jobs; pool framing roles must take/join before print or Done actions. */
     public function canTakeJob(): bool
     {
-        return $this->isEditor();
+        return $this->isEditor() || $this->usesPoolTakeJobWorkflow();
+    }
+
+    /** Show the Take job button on job detail (editors: status new; pool framing roles: not yet on job). */
+    public function showTakeJobButtonFor(Job $job): bool
+    {
+        if (! $this->canTakeJob()) {
+            return false;
+        }
+        if ($this->isEditor()) {
+            return $job->status === Job::STATUS_NEW;
+        }
+        if ($this->usesPoolTakeJobWorkflow()) {
+            return ! $this->isAssignedToStudioJob($job);
+        }
+
+        return false;
+    }
+
+    /** Pool framing roles: must take/join the studio job before print or Done line actions. */
+    public function framingMustTakeJobBeforeWorkOn(?Job $job): bool
+    {
+        return $this->usesPoolTakeJobWorkflow()
+            && $job !== null
+            && ! $this->isAssignedToStudioJob($job);
     }
 
     /** Create a studio job from a POS sale on the Job Pool page. */
     public function canOpenJobFromPool(): bool
     {
+        if ($this->isCounterStaffViewOnly()) {
+            return false;
+        }
+
         return $this->canManageJobs()
             || $this->canTakeJob()
             || in_array($this->role, [
@@ -310,6 +618,7 @@ class User extends Authenticatable
     {
         return in_array($this->role, [
             self::ROLE_ADMIN,
+            self::ROLE_MANAGER,
             self::ROLE_PRINTER,
             self::ROLE_EDITOR_PRINTER,
             self::ROLE_EDITOR_PRINTER_FRAMING,
@@ -321,10 +630,45 @@ class User extends Authenticatable
      * Whether this user may set print status on a line (matches job detail print controls + bulk rules).
      * Dedicated printer roles do not need editor assignment; editors still follow category/job rules.
      */
-    public function canApplyPrintStatusToJobEdit(JobEdit $edit): bool
+    public function canManageWorkflowReversals(): bool
     {
-        if ($edit->isFrameCategoryLine() || ! $edit->edit_done_at) {
+        return $this->isAdmin() || $this->isManager();
+    }
+
+    public function canSetPrintStatusOnJobEdit(JobEdit $edit, string $newStatus): bool
+    {
+        if (! $this->canModifyJobWorkflow()) {
             return false;
+        }
+
+        if ($edit->isDoneOnlyWorkflow() || ! $edit->needsPrintWorkflow()) {
+            return false;
+        }
+
+        $current = (string) $edit->print_status;
+
+        if ($current === JobEdit::PRINT_STATUS_PRINTED && $newStatus !== $current) {
+            return $this->canManageWorkflowReversals();
+        }
+
+        if ($newStatus === JobEdit::PRINT_STATUS_NOT_REQUIRED && ! JobEdit::allowsNotRequiredFrom($current)) {
+            return $this->canManageWorkflowReversals();
+        }
+
+        $revertingPrintDone = JobEdit::isTerminalPrintStatus($current)
+            && ! JobEdit::isTerminalPrintStatus($newStatus);
+        if ($revertingPrintDone) {
+            return $this->canManageWorkflowReversals();
+        }
+
+        if ($edit->isEditPrintWorkflow() && ! $edit->edit_done_at) {
+            return false;
+        }
+        if ($this->role === self::ROLE_PRINTER_FRAMING) {
+            $job = $edit->job ?? Job::find($edit->studio_job_id);
+            if (! $job || ! $this->isAssignedToStudioJob($job)) {
+                return false;
+            }
         }
         if ($this->isAdmin() || $this->isManager()) {
             return true;
@@ -335,8 +679,32 @@ class User extends Authenticatable
         if ($this->canEditJobItem($edit)) {
             return true;
         }
+        if ($this->isEditorPrinter() && $this->canWorkOnAssignedJobLine($edit)) {
+            return true;
+        }
 
         return in_array($this->role, [self::ROLE_PRINTER, self::ROLE_PRINTER_FRAMING], true);
+    }
+
+    public function canApplyPrintStatusToJobEdit(JobEdit $edit): bool
+    {
+        foreach (array_merge(JobEdit::terminalPrintStatuses(), [
+            JobEdit::PRINT_STATUS_PENDING,
+            JobEdit::PRINT_STATUS_SENT_TO_PRINT,
+        ]) as $status) {
+            if ($this->canSetPrintStatusOnJobEdit($edit, $status)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public function canRevertEditDoneOnJobEdit(JobEdit $edit): bool
+    {
+        return $this->canManageWorkflowReversals()
+            && $edit->needsEditWorkflow()
+            && $edit->hasEditDone();
     }
 
     /** Can add/remove editors on a job: Admin and Manager only. */
@@ -345,33 +713,43 @@ class User extends Authenticatable
         return in_array($this->role, [self::ROLE_ADMIN, self::ROLE_MANAGER], true);
     }
 
-    /** Delivery permission: Sales and Delivery roles (Admin/Manager also allowed for override). */
+    /** Mark job delivered: Sales and Delivery (Admin/Manager may override). */
     public function canDeliver(): bool
     {
-        return in_array($this->role, [self::ROLE_ADMIN, self::ROLE_MANAGER, self::ROLE_SALES, self::ROLE_DELIVERY], true);
+        return in_array($this->role, [
+            self::ROLE_ADMIN,
+            self::ROLE_MANAGER,
+            self::ROLE_SALES,
+            self::ROLE_DELIVERY,
+        ], true);
     }
 
-    /** Mark framing complete: Framing or Admin, after print status is Printed (per line item). */
+    /** Mark Done on done-only categories (Frame, Laminating, Delivery, etc.). */
     public function canMarkFramingDone(JobEdit $edit): bool
     {
-        if (! $this->isFraming() && ! $this->isAdmin()) {
+        if (! $this->canModifyJobWorkflow()) {
             return false;
-        }
-        if ($edit->framing_done_at !== null) {
-            return false;
-        }
-        $allowedIds = $this->assignedCategoryIds();
-        if (! empty($allowedIds)) {
-            $itemCategoryId = $edit->source_category_id ? (int) $edit->source_category_id : null;
-            if ($itemCategoryId !== null && ! in_array($itemCategoryId, $allowedIds, true)) {
-                return false;
-            }
-        }
-        if ($edit->isFrameCategoryLine()) {
-            return true;
         }
 
-        return $edit->print_status === JobEdit::PRINT_STATUS_PRINTED;
+        if ($edit->framing_done_at !== null || ! $edit->needsDoneWorkflow()) {
+            return false;
+        }
+        if ($this->isAdmin() || $this->isManager()) {
+            return $this->categoryAllowsJobLine($edit);
+        }
+        if ($this->role === self::ROLE_EDITOR_PRINTER_FRAMING) {
+            return $this->canWorkOnAssignedJobLine($edit);
+        }
+        if (in_array($this->role, [self::ROLE_FRAMING, self::ROLE_PRINTER_FRAMING], true)) {
+            if (! $this->categoryAllowsJobLine($edit)) {
+                return false;
+            }
+            $job = $edit->job ?? Job::find($edit->studio_job_id);
+
+            return $job && $this->isAssignedToStudioJob($job);
+        }
+
+        return false;
     }
 
     public function roleLabel(): string

@@ -108,7 +108,6 @@
                     <div class="min-w-0">
                         <div class="flex flex-wrap items-baseline gap-x-2 gap-y-1">
                             <span class="font-mono text-base font-semibold text-slate-900 dark:text-slate-100">{{ $job->ref_number }}</span>
-                            <span class="text-sm text-slate-500 dark:text-slate-400">{{ $job->customer_name ?? '—' }}</span>
                         </div>
                         <div class="mt-2 flex flex-wrap items-center gap-2">
                             <span class="inline-flex items-center rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-medium text-slate-700 ring-1 ring-inset ring-slate-200/80 dark:bg-slate-700 dark:text-slate-200 dark:ring-slate-600">{{ $job->status }}</span>

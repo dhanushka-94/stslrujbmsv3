@@ -35,7 +35,8 @@ class UserController extends Controller
      */
     public function report(User $user): View
     {
-        if (auth()->id() !== $user->id && ! auth()->user()->isAdmin() && ! auth()->user()->isManager()) {
+        $viewer = auth()->user();
+        if (auth()->id() !== $user->id && ! $viewer->canViewOtherUsersReports()) {
             abort(403);
         }
         $user->load('editorCategories');
@@ -90,13 +91,7 @@ class UserController extends Controller
         $valid['password'] = Hash::make($valid['password']);
         $valid['is_active'] = $request->boolean('is_active', true);
         $user = User::create($valid);
-        if (in_array($user->role, User::rolesWithCategoryAssignments(), true)) {
-            $ids = $request->input('category_ids', []);
-            $ids = is_array($ids) ? array_filter(array_map('intval', $ids)) : [];
-            foreach ($ids as $sourceCategoryId) {
-                EditorCategory::create(['user_id' => $user->id, 'source_category_id' => $sourceCategoryId]);
-            }
-        }
+        $this->syncUserCategoryAssignments($user, $request);
         ActivityLog::log('user_created', 'Created user: ' . $user->name . ' (' . $user->email . ')', 'user', $user->id);
         return redirect()->route('users.index')->with('success', 'User created.');
     }
@@ -131,16 +126,7 @@ class UserController extends Controller
             $request->validate(['password' => ['confirmed', Password::defaults()]]);
             $user->update(['password' => Hash::make($request->password)]);
         }
-        if (in_array($user->role, User::rolesWithCategoryAssignments(), true)) {
-            $ids = $request->input('category_ids', []);
-            $ids = is_array($ids) ? array_filter(array_map('intval', $ids)) : [];
-            EditorCategory::where('user_id', $user->id)->delete();
-            foreach ($ids as $sourceCategoryId) {
-                EditorCategory::create(['user_id' => $user->id, 'source_category_id' => $sourceCategoryId]);
-            }
-        } else {
-            EditorCategory::where('user_id', $user->id)->delete();
-        }
+        $this->syncUserCategoryAssignments($user, $request);
         $desc = 'Updated user: ' . $user->name;
         if (! $valid['is_active']) {
             $desc .= ' (deactivated)';
@@ -166,7 +152,24 @@ class UserController extends Controller
         return redirect()->route('users.index')->with('success', 'User deleted.');
     }
 
-    /** Top-level categories from source DB for editor category assignment dropdown. */
+    private function syncUserCategoryAssignments(User $user, Request $request): void
+    {
+        if (! User::roleMayHaveCategoryAssignments($user->role)) {
+            EditorCategory::where('user_id', $user->id)->delete();
+
+            return;
+        }
+
+        $ids = $request->input('category_ids', []);
+        $ids = is_array($ids) ? array_filter(array_map('intval', $ids)) : [];
+
+        EditorCategory::where('user_id', $user->id)->delete();
+        foreach ($ids as $sourceCategoryId) {
+            EditorCategory::create(['user_id' => $user->id, 'source_category_id' => $sourceCategoryId]);
+        }
+    }
+
+    /** Top-level categories from source DB for allowed-category assignment on user forms. */
     private function getSourceCategoriesForDropdown(): array
     {
         $conn = 'source';

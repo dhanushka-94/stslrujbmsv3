@@ -1,7 +1,8 @@
-<?php
+    <?php
 
 use App\Http\Controllers\ActivityLogController;
 use App\Http\Controllers\Auth\LoginController;
+use App\Http\Middleware\RejectSalesViewOnlyJobMutations;
 use App\Http\Controllers\BlockedCategoriesController;
 use App\Http\Controllers\BlockedProductsController;
 use App\Http\Controllers\DashboardController;
@@ -16,7 +17,7 @@ use Illuminate\Support\Facades\Route;
 
 Route::get('/', function () {
     if (auth()->check()) {
-        return redirect()->route('dashboard');
+        return redirect()->route(auth()->user()->homeRouteName());
     }
     return redirect()->route('login');
 });
@@ -40,29 +41,35 @@ Route::middleware('auth')->group(function () {
 
     Route::get('jobs', [JobController::class, 'index'])->name('jobs.index');
     Route::get('jobs/live', [JobController::class, 'live'])->name('jobs.live');
-    Route::post('jobs/sync', [JobController::class, 'syncFromSource'])->name('jobs.sync');
-    Route::post('jobs/from-source/{sale}', [JobController::class, 'createFromSource'])->name('jobs.from-source');
+    Route::get('jobs/pos-updated-count', [JobController::class, 'posUpdatedCount'])->name('jobs.pos-updated-count');
     Route::get('jobs/{job}', [JobController::class, 'show'])->name('jobs.show');
-    Route::post('jobs/{job}/take', [JobController::class, 'take'])->name('jobs.take');
-    Route::post('jobs/{job}/status', [JobController::class, 'updateStatus'])->name('jobs.status');
-    Route::post('jobs/{job}/edits/{edit}/claim', [JobController::class, 'claimEdit'])->name('jobs.edits.claim');
-    Route::post('jobs/{job}/edits/{edit}/estimated-minutes', [JobController::class, 'updateEstimatedMinutes'])->name('jobs.edits.estimated-minutes');
-    Route::post('jobs/{job}/edits/{edit}/customer-confirm', [JobController::class, 'confirmCustomer'])->name('jobs.edits.customer-confirm');
-    Route::post('jobs/{job}/edits/{edit}/customer-unconfirm', [JobController::class, 'unconfirmCustomer'])->name('jobs.edits.customer-unconfirm');
-    Route::post('jobs/{job}/edits/{edit}/sent-to-customer', [JobController::class, 'markSentToCustomer'])->name('jobs.edits.sent-to-customer');
-    Route::post('jobs/{job}/edits/{edit}/reedit', [JobController::class, 'markReEdit'])->name('jobs.edits.reedit');
-    Route::post('jobs/{job}/edits/{edit}/framing-done/clear', [JobController::class, 'unmarkFramingDone'])->name('jobs.edits.framing-done-clear');
-    Route::post('jobs/{job}/edits/{edit}/framing-done', [JobController::class, 'markFramingDone'])->name('jobs.edits.framing-done');
-    Route::post('jobs/{job}/edits/{edit}/step-back', [JobController::class, 'stepBackEditorStatus'])->name('jobs.edits.step-back');
-    Route::post('jobs/{job}/edits/{edit}/edit-done', [JobController::class, 'markEditDone'])->name('jobs.edits.edit-done');
-    Route::post('jobs/{job}/edits/{edit}/edit-status', [JobController::class, 'updateEditStatus'])->name('jobs.edits.edit-status');
-    Route::post('jobs/{job}/edits/bulk', [JobController::class, 'bulkEdits'])->name('jobs.edits.bulk');
-    Route::post('jobs/{job}/edits/{edit}/print-status', [JobController::class, 'updatePrintStatus'])->name('jobs.edits.print-status');
     Route::post('jobs/{job}/deliver', [JobController::class, 'deliver'])->name('jobs.deliver');
-    Route::post('jobs/{job}/editors', [JobController::class, 'addEditor'])->name('jobs.editors.add');
-    Route::delete('jobs/{job}/editors/{editor}', [JobController::class, 'removeEditor'])->name('jobs.editors.remove');
-    Route::post('jobs/{job}/dismiss', [JobController::class, 'dismiss'])->name('jobs.dismiss');
-    Route::post('jobs/{job}/undismiss', [JobController::class, 'undismiss'])->name('jobs.undismiss');
+
+    Route::middleware(RejectSalesViewOnlyJobMutations::class)->group(function () {
+        Route::post('jobs/sync', [JobController::class, 'syncFromSource'])->name('jobs.sync');
+        Route::post('jobs/from-source/{sale}', [JobController::class, 'createFromSource'])->name('jobs.from-source');
+        Route::post('jobs/{job}/resync-from-pos', [JobController::class, 'resyncFromPos'])->name('jobs.resync-from-pos');
+        Route::post('jobs/{job}/take', [JobController::class, 'take'])->name('jobs.take');
+        Route::post('jobs/{job}/status', [JobController::class, 'updateStatus'])->name('jobs.status');
+        Route::post('jobs/{job}/edits/{edit}/claim', [JobController::class, 'claimEdit'])->name('jobs.edits.claim');
+        Route::post('jobs/{job}/edits/{edit}/estimated-minutes', [JobController::class, 'updateEstimatedMinutes'])->name('jobs.edits.estimated-minutes');
+        Route::post('jobs/{job}/edits/{edit}/customer-confirm', [JobController::class, 'confirmCustomer'])->name('jobs.edits.customer-confirm');
+        Route::post('jobs/{job}/edits/{edit}/customer-unconfirm', [JobController::class, 'unconfirmCustomer'])->name('jobs.edits.customer-unconfirm');
+        Route::post('jobs/{job}/edits/{edit}/sent-to-customer', [JobController::class, 'markSentToCustomer'])->name('jobs.edits.sent-to-customer');
+        Route::post('jobs/{job}/edits/{edit}/reedit', [JobController::class, 'markReEdit'])->name('jobs.edits.reedit');
+        Route::post('jobs/{job}/edits/{edit}/framing-done/clear', [JobController::class, 'unmarkFramingDone'])->name('jobs.edits.framing-done-clear');
+        Route::post('jobs/{job}/edits/{edit}/framing-done', [JobController::class, 'markFramingDone'])->name('jobs.edits.framing-done');
+        Route::post('jobs/{job}/edits/{edit}/step-back', [JobController::class, 'stepBackEditorStatus'])->name('jobs.edits.step-back');
+        Route::post('jobs/{job}/edits/{edit}/edit-done', [JobController::class, 'markEditDone'])->name('jobs.edits.edit-done');
+        Route::post('jobs/{job}/edits/{edit}/edit-done/clear', [JobController::class, 'clearEditDone'])->name('jobs.edits.edit-done-clear');
+        Route::post('jobs/{job}/edits/{edit}/edit-status', [JobController::class, 'updateEditStatus'])->name('jobs.edits.edit-status');
+        Route::post('jobs/{job}/edits/bulk', [JobController::class, 'bulkEdits'])->name('jobs.edits.bulk');
+        Route::post('jobs/{job}/edits/{edit}/print-status', [JobController::class, 'updatePrintStatus'])->name('jobs.edits.print-status');
+        Route::post('jobs/{job}/editors', [JobController::class, 'addEditor'])->name('jobs.editors.add');
+        Route::delete('jobs/{job}/editors/{editor}', [JobController::class, 'removeEditor'])->name('jobs.editors.remove');
+        Route::post('jobs/{job}/dismiss', [JobController::class, 'dismiss'])->name('jobs.dismiss');
+        Route::post('jobs/{job}/undismiss', [JobController::class, 'undismiss'])->name('jobs.undismiss');
+    });
 
     Route::get('activity-log', [ActivityLogController::class, 'index'])->name('activity-log.index')->middleware('role:admin');
     Route::get('activity-log/{activity_log}', [ActivityLogController::class, 'show'])->name('activity-log.show')->middleware('role:admin');

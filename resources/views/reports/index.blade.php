@@ -8,7 +8,15 @@
             @include('components.icons', ['name' => 'document-check', 'class' => 'w-7 h-7'])
             Reports
         </h1>
-        <p class="mt-1 text-slate-600 dark:text-slate-400">View your report, activity log, and user reports.</p>
+        <p class="mt-1 text-slate-600 dark:text-slate-400">
+            @if(auth()->user()->canViewOtherUsersReports())
+                View user reports, editor time, and activity log.
+            @elseif(auth()->user()->canViewOwnEditorTimeReport())
+                View your activity summary and your time report.
+            @else
+                View your activity summary.
+            @endif
+        </p>
     </div>
 
     <div class="grid gap-6 md:grid-cols-2 max-w-3xl">
@@ -25,7 +33,7 @@
             </div>
         </a>
 
-        @if(auth()->user()->isAdmin() || auth()->user()->isManager())
+        @if(auth()->user()->canViewOwnEditorTimeReport() || auth()->user()->canViewAllEditorsTimeReport())
             {{-- Editor time report --}}
             <a href="{{ route('reports.editor-time') }}" class="block p-6 rounded-lg border border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] bg-[var(--color-studio-bg-card)] dark:bg-[var(--color-studio-dark-card)] hover:border-[var(--color-studio-primary)]/50 shadow-sm transition-colors">
                 <div class="flex items-center gap-3">
@@ -33,8 +41,14 @@
                         @include('components.icons', ['name' => 'clock', 'class' => 'w-6 h-6'])
                     </span>
                     <div>
-                        <h2 class="font-medium text-slate-800 dark:text-slate-100">Editor time report</h2>
-                        <p class="text-sm text-slate-500 dark:text-slate-400">Estimated time (workload) per editor with date/time log.</p>
+                        <h2 class="font-medium text-slate-800 dark:text-slate-100">
+                            {{ auth()->user()->canViewAllEditorsTimeReport() ? 'Editor time report' : 'My time report' }}
+                        </h2>
+                        <p class="text-sm text-slate-500 dark:text-slate-400">
+                            {{ auth()->user()->canViewAllEditorsTimeReport()
+                                ? 'Estimated time (workload) per editor with date/time log.'
+                                : 'Your estimated time on claimed job items with date/time log.' }}
+                        </p>
                     </div>
                 </div>
             </a>
@@ -56,7 +70,7 @@
         @endif
     </div>
 
-    @if((auth()->user()->isAdmin() || auth()->user()->isManager()) && $users->isNotEmpty())
+    @if(auth()->user()->canViewOtherUsersReports() && $users->isNotEmpty())
         <div class="mt-8 max-w-3xl">
             <h2 class="text-lg font-medium mb-3 flex items-center gap-2">
                 @include('components.icons', ['name' => 'users', 'class' => 'w-5 h-5'])

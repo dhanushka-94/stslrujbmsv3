@@ -7,19 +7,9 @@
         $globalBlockedCategoryIds = \App\Models\BlockedCategory::blockedCategoryIds();
         $globalBlockedProductIds = \App\Models\BlockedProduct::blockedProductIds();
         $currentUser = auth()->user();
-        $allowedCategoryIds = $currentUser->scopedCategoryIdsForJobLineTable();
+        $viewOnlyJobAccess = $currentUser->isCounterStaffViewOnly();
 
-        $visibleEdits = $job->edits->filter(function ($e) use ($globalBlockedCategoryIds, $globalBlockedProductIds, $allowedCategoryIds) {
-            $catId = $e->source_category_id ? (int) $e->source_category_id : null;
-            $productId = $e->source_product_id ? (int) $e->source_product_id : null;
-
-            $categoryBlocked = $catId !== null && in_array($catId, $globalBlockedCategoryIds, true);
-            $productBlocked = $productId !== null && in_array($productId, $globalBlockedProductIds, true);
-
-            $categoryAllowedForEditor = empty($allowedCategoryIds) || $catId === null || in_array($catId, $allowedCategoryIds, true);
-
-            return ! $categoryBlocked && ! $productBlocked && $categoryAllowedForEditor;
-        });
+        $visibleEdits = $job->edits->filter(fn ($e) => $currentUser->isJobLineVisibleToMe($e));
 
         $blockedEdits = $job->edits->filter(function ($e) use ($globalBlockedCategoryIds, $globalBlockedProductIds) {
             $catId = $e->source_category_id ? (int) $e->source_category_id : null;
@@ -30,45 +20,50 @@
         });
 
         $bulkCanPrint = $currentUser->canUpdatePrintStatus();
-        $bulkCanFramingDone = $currentUser->isFraming() || $currentUser->isAdmin();
+        $bulkCanFramingDone = ($currentUser->isFraming() || $currentUser->isAdmin() || $currentUser->isManager())
+            && ! $currentUser->framingMustTakeJobBeforeWorkOn($job);
         $bulkCanFramingClear = $currentUser->isAdmin() || $currentUser->isManager();
         $bulkCanTime = $currentUser->isAdmin() || $currentUser->isManager() || $currentUser->isEditor();
-        $bulkHasNonFrameLines = $visibleEdits->contains(fn ($e) => ! $e->isFrameCategoryLine());
+        $bulkHasEditPrintLines = $visibleEdits->contains(fn ($e) => $e->isEditPrintWorkflow());
+        $bulkHasPrintLines = $visibleEdits->contains(fn ($e) => $e->needsPrintWorkflow());
         $bulkCanEditorPipeline = $currentUser->isEditor() || $currentUser->isAdmin() || $currentUser->isManager();
-        $showBulkJobItemsBar = $visibleEdits->isNotEmpty() && (
-            $bulkCanPrint
+        $showBulkJobItemsBar = ! $viewOnlyJobAccess && $visibleEdits->isNotEmpty() && (
+            ($bulkCanPrint && $bulkHasPrintLines)
             || $bulkCanFramingDone
             || $bulkCanFramingClear
-            || ($bulkCanTime && $bulkHasNonFrameLines)
-            || ($bulkCanEditorPipeline && $bulkHasNonFrameLines)
+            || ($bulkCanTime && $bulkHasEditPrintLines)
+            || ($bulkCanEditorPipeline && $bulkHasEditPrintLines)
         );
 
-        $lineWorkflowComplete = fn ($e) => $e->isFrameCategoryLine()
-            ? $e->framing_done_at !== null
-            : ($e->edit_done_at && in_array($e->print_status, ['printed', 'not_required'], true));
+        $lineWorkflowComplete = fn ($e) => $e->isWorkflowCompleteForJob();
 
         $totalItems = $visibleEdits->count();
         $jobComplete = $totalItems > 0 && $visibleEdits->every($lineWorkflowComplete);
 
-        $nonFrameVisible = $visibleEdits->filter(fn ($e) => ! $e->isFrameCategoryLine());
-        $frameVisible = $visibleEdits->filter(fn ($e) => $e->isFrameCategoryLine());
-        $nonFrameCount = $nonFrameVisible->count();
-        $editDoneCount = $nonFrameVisible->filter(fn ($e) => $e->edit_done_at)->count();
-        $editingComplete = $nonFrameCount === 0 || ($nonFrameCount > 0 && $editDoneCount === $nonFrameCount);
+        $editPrintVisible = $visibleEdits->filter(fn ($e) => $e->isEditPrintWorkflow());
+        $printOnlyVisible = $visibleEdits->filter(fn ($e) => $e->isPrintOnlyWorkflow());
+        $doneOnlyVisible = $visibleEdits->filter(fn ($e) => $e->isDoneOnlyWorkflow());
+        $editPrintCount = $editPrintVisible->count();
+        $editDoneCount = $editPrintVisible->filter(fn ($e) => $e->edit_done_at)->count();
+        $editingComplete = $editPrintCount === 0 || ($editPrintCount > 0 && $editDoneCount === $editPrintCount);
 
-        $editDoneItemsForPrint = $nonFrameVisible->whereNotNull('edit_done_at');
-        $editDoneForPrintCount = $editDoneItemsForPrint->count();
-        $printedOrNotRequiredCount = $editDoneItemsForPrint->filter(fn ($e) => in_array($e->print_status, ['printed', 'not_required'], true))->count();
-        $printingNotStarted = $nonFrameCount > 0 && $editDoneForPrintCount === 0;
-        $printingComplete = $nonFrameCount === 0 || $editDoneForPrintCount === 0
-            || $printedOrNotRequiredCount === $editDoneForPrintCount;
+        $printWorkflowVisible = $visibleEdits->filter(fn ($e) => $e->needsPrintWorkflow());
+        $printWorkflowCount = $printWorkflowVisible->count();
+        $printCompleteCount = $printWorkflowVisible->filter(fn ($e) => in_array($e->print_status, ['printed', 'not_required'], true))->count();
+        $printingNotStarted = $editPrintCount > 0 && $editPrintVisible->whereNotNull('edit_done_at')->count() === 0 && $printOnlyVisible->filter(fn ($e) => in_array($e->print_status, ['printed', 'not_required'], true))->count() === 0;
+        $printingComplete = $printWorkflowCount === 0 || $printCompleteCount === $printWorkflowCount;
 
-        $framingLinesComplete = $frameVisible->isEmpty()
-            || $frameVisible->every(fn ($e) => $e->framing_done_at !== null);
+        $doneLinesComplete = $doneOnlyVisible->isEmpty()
+            || $doneOnlyVisible->every(fn ($e) => $e->framing_done_at !== null);
 
         $snapshotLineState = function (\App\Models\JobEdit $e): string {
-            if ($e->isFrameCategoryLine()) {
-                return $e->framing_done_at ? 'Framing complete' : 'Awaiting framing';
+            if ($e->isDoneOnlyWorkflow()) {
+                return $e->framing_done_at ? 'Done' : 'Pending';
+            }
+            if ($e->isPrintOnlyWorkflow()) {
+                return in_array($e->print_status, ['printed', 'not_required'], true)
+                    ? 'Print complete'
+                    : 'Awaiting print';
             }
             if ($e->edit_done_at) {
                 return in_array($e->print_status, ['printed', 'not_required'], true)
@@ -83,7 +78,7 @@
         };
 
         $snapshotPrintLabel = function (\App\Models\JobEdit $e): string {
-            if ($e->isFrameCategoryLine()) {
+            if ($e->isDoneOnlyWorkflow()) {
                 return '—';
             }
 
@@ -100,7 +95,7 @@
             if ($e->framing_done_at) {
                 return 'Done ' . $e->framing_done_at->format('M j, H:i');
             }
-            if ($e->isFrameCategoryLine()) {
+            if ($e->isDoneOnlyWorkflow()) {
                 return 'Pending';
             }
 
@@ -150,9 +145,11 @@
                             @include('components.icons', ['name' => 'briefcase', 'class' => 'w-6 h-6'])
                         </span>
                         <span class="font-mono tracking-tight text-slate-900 dark:text-slate-100">{{ $job->ref_number }}</span>
-                    </h1>
-                    @if(filled($job->customer_name))
-                        <p class="mt-2 text-base text-slate-700 dark:text-slate-200">{{ $job->customer_name }}</p>
+        </h1>
+                    @if(filled($posStaffNote ?? null))
+                        <div class="mt-3 max-w-2xl">
+                            <x-pos-staff-note :note="$posStaffNote" />
+                        </div>
                     @endif
                     <div class="mt-4 flex flex-wrap gap-2">
                         <span class="inline-flex items-center gap-1.5 rounded-full border border-slate-200/90 bg-white/80 px-3 py-1 text-sm text-slate-700 shadow-sm dark:border-slate-600 dark:bg-slate-800/80 dark:text-slate-200">
@@ -171,12 +168,274 @@
                     </div>
                 </div>
                 <a href="{{ route('jobs.index') }}" class="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-[var(--color-studio-border)] bg-white px-4 py-2.5 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-studio-primary)] focus-visible:ring-offset-2 dark:border-[var(--color-studio-dark-border)] dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700 dark:focus-visible:ring-offset-slate-900">
-                    @include('components.icons', ['name' => 'arrow-left', 'class' => 'w-4 h-4'])
-                    Back to jobs
-                </a>
-            </div>
+            @include('components.icons', ['name' => 'arrow-left', 'class' => 'w-4 h-4'])
+            Back to jobs
+        </a>
+    </div>
         </div>
     </section>
+
+    @if($viewOnlyJobAccess)
+        <div class="mb-6 rounded-lg border border-sky-200/90 bg-sky-50/80 px-4 py-3 text-sm text-sky-950 dark:border-sky-800/60 dark:bg-sky-950/30 dark:text-sky-100" role="status">
+            @if(auth()->user()->isDeliveryViewOnly())
+                <span class="font-semibold">Delivery — completed jobs only.</span>
+                You can view line status and use <strong>Mark delivered</strong> below. Editing, print, and Done actions are not available.
+                        @else
+                <span class="font-semibold">Sales — view only.</span>
+                You can see every category and line status. You cannot edit, print, or mark Done. When the job is <strong>Completed</strong>, use <strong>Mark delivered</strong> below.
+                        @endif
+                    </div>
+    @endif
+
+    @if(!empty($posSaleMissing))
+        <div class="mb-6 rounded-lg border border-rose-200/90 bg-rose-50/80 px-4 py-3 text-sm text-rose-950 dark:border-rose-800/50 dark:bg-rose-950/30 dark:text-rose-100" role="status">
+            <span class="font-semibold">POS bill deleted</span>
+            — the linked POS sale is no longer in the POS database.
+            This job keeps its existing lines and progress; it is not a POS line update.
+            Live POS dates, staff note, and Apply pending are unavailable for this bill.
+                </div>
+    @elseif(!empty($posLineDrift['differs']))
+        <div class="mb-6 overflow-hidden rounded-xl border border-orange-200/90 bg-orange-50/70 shadow-sm dark:border-orange-800/50 dark:bg-orange-950/25">
+            <div class="flex flex-col gap-3 border-b border-orange-200/80 px-4 py-3 dark:border-orange-800/40 sm:flex-row sm:items-start sm:justify-between">
+                <div class="min-w-0">
+                    <p class="text-sm font-semibold text-orange-950 dark:text-orange-100">POS bill updated — review pending changes</p>
+                    @php
+                        $tz = config('app.timezone');
+                        $posTsBanner = $posSaleTimestamps ?? ['created' => null, 'updated' => null];
+                        $billCreatedAt = null;
+                        $billUpdatedAt = null;
+                        if (! empty($posTsBanner['created'])) {
+                            try { $billCreatedAt = \Illuminate\Support\Carbon::parse($posTsBanner['created'])->timezone($tz); } catch (\Throwable) { $billCreatedAt = null; }
+                        }
+                        if (! empty($posTsBanner['updated'])) {
+                            try { $billUpdatedAt = \Illuminate\Support\Carbon::parse($posTsBanner['updated'])->timezone($tz); } catch (\Throwable) { $billUpdatedAt = null; }
+                        }
+                    @endphp
+                    <p class="mt-1 text-sm tabular-nums text-orange-900/90 dark:text-orange-100/90">
+                        <span class="font-semibold">Bill updated:</span>
+                        {{ $billUpdatedAt ? $billUpdatedAt->format('M j, Y g:i A') : '—' }}
+                        <span class="mx-1 text-orange-700/70 dark:text-orange-300/70">·</span>
+                        <span class="font-semibold">Bill created:</span>
+                        {{ $billCreatedAt ? $billCreatedAt->format('M j, Y g:i A') : '—' }}
+                    </p>
+                    <p class="mt-1 text-sm text-orange-900/90 dark:text-orange-100/90">
+                        Job still has the <strong>first / current lines</strong>. POS has newer lines.
+                        {{ $posLineDrift['summary'] }}
+                        (job {{ $posLineDrift['job_line_count'] }} · POS {{ $posLineDrift['pos_line_count'] }}).
+                    </p>
+                </div>
+                @if(auth()->user()->canModifyJobWorkflow() && filled($job->source_id))
+                    <form action="{{ route('jobs.resync-from-pos', $job) }}" method="POST" class="shrink-0" onsubmit="return confirm('Apply pending POS updates to this job? Progress is kept for matching POS lines. Lines removed in POS will be removed from the job.');">
+                        @csrf
+                        <button type="submit" class="inline-flex items-center justify-center rounded-lg bg-orange-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-orange-700">
+                            Apply pending updates
+                        </button>
+                    </form>
+                @endif
+            </div>
+
+            <div class="grid gap-0 md:grid-cols-3">
+                <div class="border-b border-orange-200/70 p-4 dark:border-orange-800/40 md:border-b-0 md:border-r">
+                    <h3 class="text-[11px] font-semibold uppercase tracking-wide text-slate-600 dark:text-slate-300">On job now</h3>
+                    <p class="mt-0.5 text-xs text-slate-500 dark:text-slate-400">First opened / current job lines</p>
+                    <ul class="mt-3 space-y-2 text-sm">
+                        @forelse(($posLineDrift['job_lines'] ?? []) as $line)
+                            <li class="rounded-md border border-slate-200/80 bg-white/80 px-2.5 py-1.5 dark:border-slate-600/70 dark:bg-slate-900/40">
+                                <span class="font-medium text-slate-900 dark:text-slate-100">{{ $line['name'] }}</span>
+                                @if(!empty($line['unit_label']))
+                                    <span class="text-[11px] text-slate-500"> · {{ $line['unit_label'] }}</span>
+                                @endif
+                                @if(!empty($line['category_name']))
+                                    <span class="mt-0.5 block text-[11px] text-slate-500 dark:text-slate-400">{{ $line['category_name'] }}</span>
+                                @endif
+                            </li>
+                        @empty
+                            <li class="text-xs text-slate-500">No lines</li>
+                        @endforelse
+                    </ul>
+                </div>
+
+                <div class="border-b border-orange-200/70 p-4 dark:border-orange-800/40 md:border-b-0 md:border-r">
+                    <h3 class="text-[11px] font-semibold uppercase tracking-wide text-emerald-800 dark:text-emerald-300">On POS now</h3>
+                    <p class="mt-0.5 text-xs text-slate-500 dark:text-slate-400">Latest bill after edit</p>
+                    <ul class="mt-3 space-y-2 text-sm">
+                        @forelse(($posLineDrift['pos_lines'] ?? []) as $line)
+                            <li class="rounded-md border border-emerald-200/80 bg-white/80 px-2.5 py-1.5 dark:border-emerald-800/50 dark:bg-slate-900/40">
+                                <span class="font-medium text-slate-900 dark:text-slate-100">{{ $line['name'] }}</span>
+                                @if(!empty($line['unit_label']))
+                                    <span class="text-[11px] text-slate-500"> · {{ $line['unit_label'] }}</span>
+                                @endif
+                                @if(!empty($line['category_name']))
+                                    <span class="mt-0.5 block text-[11px] text-slate-500 dark:text-slate-400">{{ $line['category_name'] }}</span>
+                                @endif
+                            </li>
+                        @empty
+                            <li class="text-xs text-slate-500">No lines on POS</li>
+                        @endforelse
+                    </ul>
+                </div>
+
+                <div class="p-4">
+                    <h3 class="text-[11px] font-semibold uppercase tracking-wide text-orange-800 dark:text-orange-300">Pending to apply</h3>
+                    <p class="mt-0.5 text-xs text-slate-500 dark:text-slate-400">{{ (int) ($posLineDrift['pending_count'] ?? 0) }} change(s) waiting</p>
+                    <div class="mt-3 space-y-3 text-sm">
+                        @if(!empty($posLineDrift['added']))
+                <div>
+                                <p class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-emerald-700 dark:text-emerald-400">Will add</p>
+                                <ul class="space-y-1.5">
+                                    @foreach($posLineDrift['added'] as $line)
+                                        <li class="rounded-md border border-emerald-300/70 bg-emerald-50/80 px-2.5 py-1.5 dark:border-emerald-700/50 dark:bg-emerald-950/30">
+                                            <span class="font-medium text-emerald-950 dark:text-emerald-100">+ {{ $line['name'] }}</span>
+                                            @if(!empty($line['unit_label']))
+                                                <span class="text-[11px] opacity-80"> · {{ $line['unit_label'] }}</span>
+                                            @endif
+                                        </li>
+                                    @endforeach
+                                </ul>
+                            </div>
+                        @endif
+                        @if(!empty($posLineDrift['removed']))
+                            <div>
+                                <p class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-rose-700 dark:text-rose-400">Will remove</p>
+                                <ul class="space-y-1.5">
+                                    @foreach($posLineDrift['removed'] as $line)
+                                        <li class="rounded-md border border-rose-300/70 bg-rose-50/80 px-2.5 py-1.5 dark:border-rose-700/50 dark:bg-rose-950/30">
+                                            <span class="font-medium text-rose-950 dark:text-rose-100">− {{ $line['name'] }}</span>
+                                            @if(!empty($line['unit_label']))
+                                                <span class="text-[11px] opacity-80"> · {{ $line['unit_label'] }}</span>
+                                            @endif
+                                        </li>
+                                    @endforeach
+                                </ul>
+                            </div>
+                        @endif
+                        @if(!empty($posLineDrift['changed']))
+                            <div>
+                                <p class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-amber-800 dark:text-amber-300">Will update</p>
+                                <ul class="space-y-1.5">
+                                    @foreach($posLineDrift['changed'] as $chg)
+                                        <li class="rounded-md border border-amber-300/70 bg-amber-50/80 px-2.5 py-1.5 dark:border-amber-700/50 dark:bg-amber-950/30">
+                                            <span class="block text-xs text-slate-600 dark:text-slate-300">Was: {{ $chg['from']['name'] }}</span>
+                                            <span class="block font-medium text-amber-950 dark:text-amber-100">Now: {{ $chg['to']['name'] }}</span>
+                                        </li>
+                                    @endforeach
+                                </ul>
+                            </div>
+                        @endif
+                        @if(empty($posLineDrift['added']) && empty($posLineDrift['removed']) && empty($posLineDrift['changed']))
+                            <p class="text-xs text-slate-500">No line-level pending items detected.</p>
+                        @endif
+                    </div>
+                </div>
+            </div>
+        </div>
+    @endif
+
+    @if(($posApplyHistories ?? collect())->isNotEmpty())
+        <div class="mb-6 overflow-hidden rounded-xl border border-indigo-200/90 bg-indigo-50/50 shadow-sm dark:border-indigo-800/50 dark:bg-indigo-950/20">
+            <div class="border-b border-indigo-200/80 px-4 py-3 dark:border-indigo-800/40">
+                <h2 class="text-sm font-semibold text-indigo-950 dark:text-indigo-100">POS apply history</h2>
+                <p class="mt-0.5 text-xs text-indigo-900/80 dark:text-indigo-200/80">Previous job lines vs new lines after each Apply pending updates, with dates.</p>
+            </div>
+            <div class="divide-y divide-indigo-200/70 dark:divide-indigo-800/40">
+                @foreach($posApplyHistories as $hist)
+                    @php
+                        $tz = config('app.timezone');
+                        $appliedAt = $hist->applied_at?->timezone($tz);
+                        $posCreated = $hist->pos_sale_created_at?->timezone($tz);
+                        $posUpdated = $hist->pos_sale_updated_at?->timezone($tz);
+                    @endphp
+                    <details class="group px-4 py-3" @if($loop->first) open @endif>
+                        <summary class="cursor-pointer list-none">
+                            <div class="flex flex-wrap items-start justify-between gap-2">
+                                <div class="min-w-0">
+                                    <p class="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                                        Applied {{ $appliedAt ? $appliedAt->format('M j, Y g:i A') : '—' }}
+                                        @if($hist->appliedByUser)
+                                            <span class="font-normal text-slate-500 dark:text-slate-400">by {{ $hist->appliedByUser->name }}</span>
+                                        @endif
+                                    </p>
+                                    <p class="mt-0.5 text-xs text-slate-600 dark:text-slate-300">{{ $hist->summary ?: 'POS lines applied' }}</p>
+                                    <p class="mt-1 text-[11px] tabular-nums text-slate-500 dark:text-slate-400">
+                                        Bill created: {{ $posCreated ? $posCreated->format('M j, Y g:i A') : '—' }}
+                                        · Bill updated: {{ $posUpdated ? $posUpdated->format('M j, Y g:i A') : '—' }}
+                                    </p>
+                                </div>
+                                <span class="text-[11px] font-semibold uppercase tracking-wide text-indigo-700 dark:text-indigo-300 group-open:hidden">Show</span>
+                                <span class="hidden text-[11px] font-semibold uppercase tracking-wide text-indigo-700 dark:text-indigo-300 group-open:inline">Hide</span>
+                            </div>
+                        </summary>
+
+                        <div class="mt-3 grid gap-3 md:grid-cols-2">
+                            <div class="rounded-lg border border-slate-200/90 bg-white/80 p-3 dark:border-slate-600/70 dark:bg-slate-900/40">
+                                <h3 class="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Previous on job</h3>
+                                <ul class="mt-2 space-y-1.5 text-sm">
+                                    @forelse(($hist->previous_lines ?? []) as $line)
+                                        <li class="text-slate-800 dark:text-slate-100">{{ $line['name'] ?? '—' }}
+                                            @if(!empty($line['unit_label']))
+                                                <span class="text-[11px] text-slate-500"> · {{ $line['unit_label'] }}</span>
+                                            @endif
+                                        </li>
+                                    @empty
+                                        <li class="text-xs text-slate-500">No lines</li>
+                                    @endforelse
+                                </ul>
+                            </div>
+                            <div class="rounded-lg border border-emerald-200/80 bg-white/80 p-3 dark:border-emerald-800/50 dark:bg-slate-900/40">
+                                <h3 class="text-[11px] font-semibold uppercase tracking-wide text-emerald-800 dark:text-emerald-300">New after apply</h3>
+                                <ul class="mt-2 space-y-1.5 text-sm">
+                                    @forelse(($hist->new_lines ?? []) as $line)
+                                        <li class="text-slate-800 dark:text-slate-100">{{ $line['name'] ?? '—' }}
+                                            @if(!empty($line['unit_label']))
+                                                <span class="text-[11px] text-slate-500"> · {{ $line['unit_label'] }}</span>
+                                            @endif
+                                        </li>
+                                    @empty
+                                        <li class="text-xs text-slate-500">No lines</li>
+                                    @endforelse
+                                </ul>
+                            </div>
+                        </div>
+
+                        @if(!empty($hist->added) || !empty($hist->removed) || !empty($hist->changed))
+                            <div class="mt-3 grid gap-3 sm:grid-cols-3">
+                                @if(!empty($hist->added))
+                                    <div>
+                                        <p class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-emerald-700 dark:text-emerald-400">Added</p>
+                                        <ul class="space-y-1 text-xs">
+                                            @foreach($hist->added as $line)
+                                                <li class="text-emerald-800 dark:text-emerald-300">+ {{ $line['name'] ?? '—' }}</li>
+                                            @endforeach
+                                        </ul>
+                                    </div>
+                                @endif
+                                @if(!empty($hist->removed))
+                                    <div>
+                                        <p class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-rose-700 dark:text-rose-400">Removed</p>
+                                        <ul class="space-y-1 text-xs">
+                                            @foreach($hist->removed as $line)
+                                                <li class="text-rose-800 dark:text-rose-300">− {{ $line['name'] ?? '—' }}</li>
+                                            @endforeach
+                                        </ul>
+                                    </div>
+                                @endif
+                                @if(!empty($hist->changed))
+                                    <div>
+                                        <p class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-amber-800 dark:text-amber-300">Changed</p>
+                                        <ul class="space-y-1 text-xs">
+                                            @foreach($hist->changed as $chg)
+                                                <li class="text-amber-900 dark:text-amber-200">{{ $chg['from']['name'] ?? '—' }} → {{ $chg['to']['name'] ?? '—' }}</li>
+                                            @endforeach
+                                        </ul>
+                                    </div>
+                                @endif
+                            </div>
+                        @endif
+                    </details>
+                @endforeach
+            </div>
+        </div>
+    @endif
 
     <div class="grid gap-6 md:grid-cols-2 mb-8">
         <div class="rounded-xl border border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] bg-[var(--color-studio-bg-card)] dark:bg-[var(--color-studio-dark-card)] shadow-sm overflow-hidden flex flex-col">
@@ -185,6 +444,26 @@
                 <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-600 dark:text-slate-300">Details</h2>
             </div>
             <div class="p-4 sm:p-5 space-y-5 flex-1 flex flex-col">
+                @php
+                    $tz = config('app.timezone');
+                    $posTs = $posSaleTimestamps ?? ['created' => null, 'updated' => null];
+                    $posCreatedAt = null;
+                    $posEditedAt = null;
+                    if (! empty($posTs['created'])) {
+                        try {
+                            $posCreatedAt = \Illuminate\Support\Carbon::parse($posTs['created'])->timezone($tz);
+                        } catch (\Throwable) {
+                            $posCreatedAt = null;
+                        }
+                    }
+                    if (! empty($posTs['updated'])) {
+                        try {
+                            $posEditedAt = \Illuminate\Support\Carbon::parse($posTs['updated'])->timezone($tz);
+                        } catch (\Throwable) {
+                            $posEditedAt = null;
+                        }
+                    }
+                @endphp
                 <dl class="grid grid-cols-1 gap-4 sm:grid-cols-3">
                     <div>
                         <dt class="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Reference</dt>
@@ -201,9 +480,27 @@
                         <dd class="mt-1 text-base font-medium text-slate-900 dark:text-slate-100 tabular-nums">
                             @if($job->due_date && $job->dueHasTimeAssigned())
                                 {{ $job->due_date->format('g:i A') }}
-                            @else
+                        @else
                                 <span class="text-slate-500 dark:text-slate-400 font-normal">Not assigned</span>
-                            @endif
+                        @endif
+                        </dd>
+                    </div>
+                    <div>
+                        <dt class="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Bill created</dt>
+                        <dd class="mt-1 text-base font-medium tabular-nums text-slate-900 dark:text-slate-100">
+                            {{ $posCreatedAt ? $posCreatedAt->format('M j, Y g:i A') : '—' }}
+                        </dd>
+                </div>
+                    <div>
+                        <dt class="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Bill updated</dt>
+                        <dd class="mt-1 text-base font-medium tabular-nums text-slate-900 dark:text-slate-100">
+                            {{ $posEditedAt ? $posEditedAt->format('M j, Y g:i A') : '—' }}
+                        </dd>
+                    </div>
+                    <div>
+                        <dt class="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Job opened</dt>
+                        <dd class="mt-1 text-base font-medium tabular-nums text-slate-900 dark:text-slate-100">
+                            {{ $job->created_at->format('M j, Y g:i A') }}
                         </dd>
                     </div>
                 </dl>
@@ -216,97 +513,97 @@
                             <span class="min-w-0 text-right sm:text-right">
                                 @if($totalItems === 0)
                                     <span class="inline-flex rounded-md bg-slate-200/90 px-2 py-0.5 text-xs font-medium text-slate-800 dark:bg-slate-700 dark:text-slate-100">No items</span>
-                                @elseif($nonFrameCount === 0)
+                                @elseif($editPrintCount === 0)
                                     <span class="inline-flex rounded-md bg-slate-200/90 px-2 py-0.5 text-xs font-medium text-slate-800 dark:bg-slate-700 dark:text-slate-100">N/A</span>
-                                    <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1 sm:mt-0.5">FRAME-only — no editor steps</span>
+                                    <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1 sm:mt-0.5">No edit/print lines on this job</span>
                                 @elseif($editingComplete)
                                     <span class="inline-flex rounded-md bg-emerald-600 px-2 py-0.5 text-xs font-medium text-white dark:bg-emerald-500 dark:text-emerald-950">Complete</span>
-                                    <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1">{{ $editDoneCount }} / {{ $nonFrameCount }} non-frame Edit Done</span>
+                                    <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1">{{ $editDoneCount }} / {{ $editPrintCount }} edit/print Edit Done</span>
                                 @else
                                     <span class="inline-flex rounded-md bg-amber-500 px-2 py-0.5 text-xs font-medium text-white dark:bg-amber-400 dark:text-amber-950">In progress</span>
-                                    <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1">{{ $editDoneCount }} / {{ $nonFrameCount }} non-frame Edit Done</span>
+                                    <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1">{{ $editDoneCount }} / {{ $editPrintCount }} edit/print Edit Done</span>
                                 @endif
                             </span>
                         </li>
                         <li class="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between sm:gap-3 pt-2 border-t border-slate-200/70 dark:border-slate-600/60">
                             <span class="shrink-0 text-slate-600 dark:text-slate-300 font-medium">Printing</span>
                             <span class="min-w-0 text-right sm:text-right">
-                                @if($nonFrameCount === 0)
+                                @if($printWorkflowCount === 0)
                                     <span class="inline-flex rounded-md bg-slate-200/90 px-2 py-0.5 text-xs font-medium text-slate-800 dark:bg-slate-700 dark:text-slate-100">N/A</span>
-                                    <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1 sm:mt-0.5">FRAME-only — no print</span>
+                                    <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1 sm:mt-0.5">No print lines on this job</span>
                                 @elseif($printingNotStarted)
                                     <span class="inline-flex rounded-md bg-slate-200/90 px-2 py-0.5 text-xs font-medium text-slate-800 dark:bg-slate-700 dark:text-slate-100">Not started</span>
-                                    <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1">Complete editing first</span>
+                                    <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1">Complete editing first (edit/print lines)</span>
                                 @elseif($printingComplete)
                                     <span class="inline-flex rounded-md bg-emerald-600 px-2 py-0.5 text-xs font-medium text-white dark:bg-emerald-500 dark:text-emerald-950">Complete</span>
-                                    <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1">{{ $printedOrNotRequiredCount }} / {{ $editDoneForPrintCount }} printed or not required</span>
+                                    <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1">{{ $printCompleteCount }} / {{ $printWorkflowCount }} printed or not required</span>
                                 @else
                                     <span class="inline-flex rounded-md bg-amber-500 px-2 py-0.5 text-xs font-medium text-white dark:bg-amber-400 dark:text-amber-950">In progress</span>
-                                    <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1">{{ $printedOrNotRequiredCount }} / {{ $editDoneForPrintCount }} printed or not required</span>
+                                    <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1">{{ $printCompleteCount }} / {{ $printWorkflowCount }} printed or not required</span>
                                 @endif
                             </span>
                         </li>
-                        @if($frameVisible->isNotEmpty())
+                        @if($doneOnlyVisible->isNotEmpty())
                         <li class="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between sm:gap-3 pt-2 border-t border-slate-200/70 dark:border-slate-600/60">
-                            <span class="shrink-0 text-slate-600 dark:text-slate-300 font-medium">Framing (FRAME)</span>
+                            <span class="shrink-0 text-slate-600 dark:text-slate-300 font-medium">Done (done-only categories)</span>
                             <span class="min-w-0 text-right sm:text-right">
-                                @if($framingLinesComplete)
+                                @if($doneLinesComplete)
                                     <span class="inline-flex rounded-md bg-emerald-600 px-2 py-0.5 text-xs font-medium text-white dark:bg-emerald-500 dark:text-emerald-950">Complete</span>
                                 @else
                                     <span class="inline-flex rounded-md bg-amber-500 px-2 py-0.5 text-xs font-medium text-white dark:bg-amber-400 dark:text-amber-950">In progress</span>
                                 @endif
-                                <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1">{{ $frameVisible->whereNotNull('framing_done_at')->count() }} / {{ $frameVisible->count() }} done</span>
+                                <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1">{{ $doneOnlyVisible->whereNotNull('framing_done_at')->count() }} / {{ $doneOnlyVisible->count() }} done</span>
                             </span>
                         </li>
                         @endif
                         <li class="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between sm:gap-3 pt-2 border-t border-slate-200/70 dark:border-slate-600/60">
                             <span class="shrink-0 text-slate-600 dark:text-slate-300 font-medium">Job lines</span>
                             <span class="min-w-0 text-right sm:text-right">
-                                @if($jobComplete)
+                        @if($jobComplete)
                                     <span class="inline-flex rounded-md bg-emerald-600 px-2 py-0.5 text-xs font-medium text-white dark:bg-emerald-500 dark:text-emerald-950">Complete</span>
-                                @else
+                        @else
                                     <span class="inline-flex rounded-md bg-slate-600 px-2 py-0.5 text-xs font-medium text-white dark:bg-slate-500 dark:text-slate-900">In progress</span>
-                                    <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1">FRAME → framing; other lines → edit + print</span>
-                                @endif
+                                    <span class="block text-xs text-slate-500 dark:text-slate-400 mt-1">All line workflows must be complete</span>
+                        @endif
                             </span>
                         </li>
                     </ul>
-                </div>
+                    </div>
 
                 <div class="pt-1 border-t border-slate-200/80 dark:border-slate-700/80">
                     <div class="flex items-center gap-2 mb-2">
                         @include('components.icons', ['name' => 'users', 'class' => 'w-4 h-4 text-slate-500 dark:text-slate-400'])
                         <span class="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Editors</span>
-                    </div>
+                </div>
                     @if($job->editors->isNotEmpty())
                         <div class="flex flex-wrap gap-2">
-                            @foreach($job->editors as $ed)
+                        @foreach($job->editors as $ed)
                                 <span class="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white pl-2.5 pr-1 py-0.5 text-sm text-slate-800 shadow-sm dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100">
                                     <span class="truncate max-w-[10rem] sm:max-w-[14rem]">{{ $ed->name }}</span>
                                     @if(auth()->user()->canAddOrRemoveEditorsOn())
                                         <form action="{{ route('jobs.editors.remove', [$job, $ed]) }}" method="POST" class="inline shrink-0" onsubmit="return confirm('Remove this editor?');">
-                                            @csrf
-                                            @method('DELETE')
+                                        @csrf
+                                        @method('DELETE')
                                             <button type="submit" class="rounded-full p-1 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40" title="Remove editor">✕</button>
-                                        </form>
-                                    @endif
-                                </span>
-                            @endforeach
+                                    </form>
+                                @endif
+                            </span>
+                        @endforeach
                         </div>
                     @else
                         <p class="text-sm text-slate-500 dark:text-slate-400">—</p>
                     @endif
                     @if(auth()->user()->canAddOrRemoveEditorsOn() && $editorsAvailable->diff($job->editors)->isNotEmpty())
                         <form action="{{ route('jobs.editors.add', $job) }}" method="POST" class="mt-3 flex flex-col gap-2 sm:flex-row">
-                            @csrf
+                        @csrf
                             <select name="user_id" class="min-h-[2.5rem] flex-1 rounded-lg border border-[var(--color-studio-border)] bg-white px-3 py-2 text-sm dark:border-[var(--color-studio-dark-border)] dark:bg-slate-800">
-                                @foreach($editorsAvailable->diff($job->editors) as $u)
-                                    <option value="{{ $u->id }}">{{ $u->name }} ({{ $u->email }})</option>
-                                @endforeach
-                            </select>
+                            @foreach($editorsAvailable->diff($job->editors) as $u)
+                                <option value="{{ $u->id }}">{{ $u->name }} ({{ $u->email }})</option>
+                            @endforeach
+                        </select>
                             <button type="submit" class="inline-flex min-h-[2.5rem] items-center justify-center rounded-lg bg-[var(--color-studio-primary)] px-4 text-sm font-medium text-white shadow-sm hover:opacity-95">Add editor</button>
-                        </form>
-                    @endif
+                    </form>
+                @endif
                 </div>
 
                 @if($job->delivered_at)
@@ -317,11 +614,11 @@
                 @endif
                 @if($job->notes)
                     <div class="rounded-lg border border-amber-200/80 bg-amber-50/50 px-3 py-2.5 text-sm text-amber-950 dark:border-amber-800/40 dark:bg-amber-950/25 dark:text-amber-100">
-                        <span class="font-semibold text-amber-900 dark:text-amber-200">Notes</span>
+                        <span class="font-semibold text-amber-900 dark:text-amber-200">Sale note</span>
                         <p class="mt-1 whitespace-pre-wrap text-amber-950/95 dark:text-amber-50/95">{{ $job->notes }}</p>
                     </div>
                 @endif
-            </div>
+        </div>
         </div>
 
         <div class="rounded-xl border border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] bg-[var(--color-studio-bg-card)] dark:bg-[var(--color-studio-dark-card)] shadow-sm overflow-hidden flex flex-col">
@@ -331,51 +628,61 @@
             </div>
             <div class="p-4 sm:p-5 space-y-4 flex-1 flex flex-col">
                 <div class="space-y-3">
-                    @if(auth()->user()->canTakeJob() && $job->status === 'new')
+                    @if(auth()->user()->showTakeJobButtonFor($job))
                         <form action="{{ route('jobs.take', $job) }}" method="POST">
-                            @csrf
+                    @csrf
                             <button type="submit" class="w-full rounded-lg bg-green-600 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-green-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-green-600 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900">Take this job</button>
-                        </form>
+                </form>
+            @endif
+                    @if(auth()->user()->framingMustTakeJobBeforeWorkOn($job))
+                        <p class="rounded-lg border border-amber-200/90 bg-amber-50/80 px-3 py-2 text-xs leading-relaxed text-amber-950 dark:border-amber-800/50 dark:bg-amber-950/30 dark:text-amber-100">
+                            Use <span class="font-semibold">Take this job</span> before
+                            @if(auth()->user()->role === 'printer_framing')
+                                updating print status or marking Done on framing lines.
+                            @else
+                                marking Done on framing category lines.
+                            @endif
+                        </p>
                     @endif
                     @if($job->status === 'new' && auth()->user()->canDismissNewJobs())
-                        @if($job->isDismissedBy(auth()->user()))
+                @if($job->isDismissedBy(auth()->user()))
                             <form action="{{ route('jobs.undismiss', $job) }}" method="POST">
-                                @csrf
+                        @csrf
                                 <button type="submit" class="w-full rounded-lg bg-green-600 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-green-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-green-600 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900">Restore to job list</button>
-                            </form>
-                        @else
+                    </form>
+                @else
                             <form action="{{ route('jobs.dismiss', $job) }}" method="POST" onsubmit="return confirm('Dismiss this job? It will move to your Dismissed list and will not show on the main job list until you restore it.');">
-                                @csrf
+                        @csrf
                                 <button type="submit" class="w-full rounded-lg border-2 border-amber-500 py-2.5 text-sm font-semibold text-amber-700 transition hover:bg-amber-50 dark:text-amber-300 dark:hover:bg-amber-950/30 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900">Dismiss job</button>
-                            </form>
-                        @endif
-                    @endif
+                    </form>
+                @endif
+            @endif
                 </div>
 
                 <div class="rounded-lg border border-slate-200/90 bg-slate-50/60 p-4 dark:border-slate-600/70 dark:bg-slate-800/35">
                     <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Job status <span class="font-normal normal-case text-slate-400 dark:text-slate-500">(auto)</span></div>
                     <div class="mt-2 flex flex-wrap items-center gap-2">
                         <span class="inline-flex items-center rounded-full px-3.5 py-1.5 text-xs font-semibold {{ $jobStatusBadgeClass }}">{{ $jobStatusLabel }}</span>
-                    </div>
-                    <p class="mt-2 text-xs leading-relaxed text-slate-500 dark:text-slate-400">Updates when the job is taken, editing starts, and when every line is finished (edit + print, or framing for FRAME lines).</p>
+            </div>
+                    <p class="mt-2 text-xs leading-relaxed text-slate-500 dark:text-slate-400">Updates when the job is taken, editing starts, and when every line is finished per its category workflow (edit + print, or framing only).</p>
                 </div>
 
-                @if(auth()->user()->canDeliver() && $job->status === 'completed')
+            @if(auth()->user()->canDeliver() && $job->status === 'completed')
                     <form action="{{ route('jobs.deliver', $job) }}" method="POST" class="flex flex-col gap-2 rounded-lg border border-green-200/90 bg-green-50/40 p-3 dark:border-green-800/50 dark:bg-green-950/20 sm:flex-row sm:items-stretch">
-                        @csrf
+                    @csrf
                         <select name="delivery_method" required class="min-h-[2.5rem] flex-1 rounded-lg border border-[var(--color-studio-border)] bg-white px-3 py-2 text-sm dark:border-[var(--color-studio-dark-border)] dark:bg-slate-800">
-                            <option value="online">Online</option>
-                            <option value="walkin">Walk-in</option>
-                            <option value="courier">Courier</option>
-                        </select>
+                        <option value="online">Online</option>
+                        <option value="walkin">Walk-in</option>
+                        <option value="courier">Courier</option>
+                    </select>
                         <button type="submit" class="inline-flex min-h-[2.5rem] items-center justify-center rounded-lg bg-green-600 px-4 text-sm font-semibold text-white shadow-sm hover:bg-green-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-green-600 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 sm:shrink-0">Mark delivered</button>
-                    </form>
-                @endif
+                </form>
+            @endif
             </div>
         </div>
     </div>
 
-    <section class="mb-10 mt-2 {{ $showBulkJobItemsBar ? 'pb-24 sm:pb-20' : '' }}" aria-labelledby="job-items-heading">
+    <section class="mb-10 mt-2" aria-labelledby="job-items-heading">
         <div class="rounded-xl border border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] bg-[var(--color-studio-bg-card)] dark:bg-[var(--color-studio-dark-card)] shadow-sm overflow-hidden">
             <div class="flex flex-col gap-2 border-b border-slate-200/80 bg-gradient-to-r from-slate-50/95 to-slate-50/60 px-4 py-3 sm:flex-row sm:items-center sm:justify-between dark:border-slate-700/80 dark:from-slate-800/80 dark:to-slate-900/40">
                 <div class="flex min-w-0 items-start gap-3">
@@ -387,7 +694,12 @@
                         <p class="mt-0.5 text-xs leading-snug text-slate-500 dark:text-slate-400">POS sync · category &amp; subcategory per row · scroll horizontally on small screens</p>
                     </div>
                 </div>
-                <div class="flex flex-wrap items-center gap-2 shrink-0">
+                <div class="flex flex-col items-end gap-2 shrink-0 sm:items-end">
+                    <x-workflow-legend
+                        class="justify-end"
+                        filter-route="jobs.index"
+                        :filter-params="['section' => 'ongoing']"
+                    />
                     <span class="inline-flex items-center gap-1 rounded-full bg-white px-2.5 py-1 text-xs font-semibold text-slate-700 shadow-sm ring-1 ring-slate-200/90 dark:bg-slate-800 dark:text-slate-200 dark:ring-slate-600">{{ $visibleEdits->count() }} shown</span>
                     @if($blockedEdits->count() > 0)
                         <span class="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-900 ring-1 ring-amber-200/90 dark:bg-amber-950/50 dark:text-amber-100 dark:ring-amber-800/60">{{ $blockedEdits->count() }} blocked</span>
@@ -414,14 +726,19 @@
                             <th scope="col" class="min-w-[10rem] whitespace-nowrap px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Editor actions</th>
                             <th scope="col" class="min-w-[9rem] whitespace-nowrap px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Printer status</th>
                             <th scope="col" class="min-w-[9rem] whitespace-nowrap px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Printer actions</th>
-                            <th scope="col" class="min-w-[7rem] whitespace-nowrap px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Framing</th>
-                        </tr>
-                    </thead>
+                            <th scope="col" class="min-w-[7rem] whitespace-nowrap px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Done</th>
+                </tr>
+            </thead>
                     <tbody class="divide-y divide-slate-100 dark:divide-slate-800/80">
                 @forelse($visibleEdits as $edit)
                     @php
-                        $isFrameLine = $edit->isFrameCategoryLine();
+                        $isDoneOnlyLine = $edit->isDoneOnlyWorkflow();
+                        $isPrintOnlyLine = $edit->isPrintOnlyWorkflow();
+                        $isEditPrintLine = $edit->isEditPrintWorkflow();
                         $canEdit = auth()->user()->canEditJobItem($edit);
+                        $canApplyPrint = auth()->user()->canApplyPrintStatusToJobEdit($edit);
+                        $canRevertEditDone = auth()->user()->canRevertEditDoneOnJobEdit($edit);
+                        $canSetPrintStatus = fn (string $status) => auth()->user()->canSetPrintStatusOnJobEdit($edit, $status);
                         $isAdmin = auth()->user()->isAdmin();
                         $isClaimedByMe = $edit->claimed_by_user_id == auth()->id();
                         $isClaimedByOther = $edit->claimed_by_user_id !== null && !$isClaimedByMe;
@@ -441,11 +758,8 @@
                             $currentStep = 'sent_to_customer';
                         }
                     @endphp
-                    <tr @class(
-                        $isFrameLine
-                            ? 'border-l-[3px] border-l-teal-500 bg-teal-50/40 transition-colors dark:border-l-teal-400 dark:bg-teal-950/25'
-                            : 'transition-colors even:bg-slate-50/50 hover:bg-slate-50/90 dark:even:bg-slate-800/25 dark:hover:bg-slate-800/35'
-                    )>
+                    @php $lineTokens = \App\Support\CategoryAppearance::tokensForJobEdit($edit); @endphp
+                    <tr @class([$lineTokens['row'], 'transition-colors hover:brightness-[0.99] dark:hover:brightness-110'])>
                         @if($showBulkJobItemsBar)
                         <td class="px-1 py-2.5 align-middle text-center">
                             <input type="checkbox" name="edit_ids[]" value="{{ $edit->id }}" form="job-edits-bulk-form" class="job-bulk-row-cb h-4 w-4 rounded border-slate-300 text-[var(--color-studio-primary)] focus:ring-[var(--color-studio-primary)] dark:border-slate-600 dark:bg-slate-800">
@@ -456,20 +770,27 @@
                         </td>
                         <td class="px-3 py-2.5 align-top">
                             <div class="flex flex-col gap-1">
-                                @if($isFrameLine)
-                                    <span class="inline-flex w-fit items-center rounded-md bg-teal-100 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-teal-900 ring-1 ring-teal-200/80 dark:bg-teal-900/50 dark:text-teal-100 dark:ring-teal-700/60">Frame</span>
+                                @if(filled($edit->category_name))
+                                    <span class="inline-flex w-fit max-w-[12rem] truncate items-center rounded-md px-1.5 py-0.5 text-[10px] font-semibold {{ $lineTokens['pill'] }}" title="{{ $edit->category_name }}">{{ $edit->category_name }}</span>
+                                @else
+                                    <span class="inline-flex w-fit items-center rounded-md px-1.5 py-0.5 text-[10px] font-semibold {{ $lineTokens['badge'] }}">{{ $lineTokens['label'] }}</span>
                                 @endif
+                                <span class="inline-flex w-fit items-center rounded px-1 py-0.5 text-[9px] font-medium uppercase tracking-wide text-slate-500 ring-1 ring-slate-200/80 bg-white/80 dark:bg-slate-900/50 dark:text-slate-400 dark:ring-slate-600/80">{{ $lineTokens['short'] }}</span>
                                 <span class="font-semibold leading-snug text-slate-900 dark:text-slate-100">{{ $edit->name }}</span>
                             </div>
                         </td>
                         <td class="px-3 py-2.5 align-top text-slate-600 dark:text-slate-400">
-                            <span class="line-clamp-2">{{ $edit->category_name ?? '—' }}</span>
+                            @if(filled($edit->category_name))
+                                <span class="inline-flex max-w-full line-clamp-2 rounded px-1.5 py-0.5 text-xs font-medium {{ $lineTokens['pill'] }}">{{ $edit->category_name }}</span>
+                            @else
+                                <span>—</span>
+                            @endif
                         </td>
                         <td class="px-3 py-2.5 align-top text-slate-600 dark:text-slate-400">
                             <span class="line-clamp-2">{{ $edit->subcategory_name ?? '—' }}</span>
                         </td>
                         <td class="px-3 py-2.5 align-top text-sm">
-                            @if($isFrameLine)
+                            @if(!$edit->needsEditWorkflow())
                                 <span class="text-slate-400">—</span>
                             @elseif($edit->claimedByUser)
                                 <span class="text-slate-700 dark:text-slate-300">{{ $edit->claimedByUser->name }}</span>
@@ -478,9 +799,8 @@
                             @endif
                         </td>
                         <td class="px-3 py-2.5 text-xs align-top">
-                            @if($isFrameLine)
-                                <span class="text-teal-800 dark:text-teal-200/90 font-medium">Framing only</span>
-                                <span class="text-slate-500 dark:text-slate-400 block mt-0.5">No editor / print</span>
+                            @if(!$edit->needsEditWorkflow())
+                                <span class="text-slate-400">—</span>
                             @else
                             @php
                                 $presets = [10, 20, 30, 45, 60];
@@ -510,18 +830,18 @@
                                     <span class="text-slate-400">—</span>
                                 @endif
                                 @if(auth()->user()->canSetOrChangeJobEditEstimatedMinutes($edit))
-                                    <form action="{{ route('jobs.edits.estimated-minutes', [$job, $edit]) }}" method="POST" class="mt-1 flex flex-wrap items-center gap-1">
-                                        @csrf
+                                <form action="{{ route('jobs.edits.estimated-minutes', [$job, $edit]) }}" method="POST" class="mt-1 flex flex-wrap items-center gap-1">
+                                    @csrf
                                         <select name="estimated_minutes" required class="text-xs px-2 py-1 rounded border border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] bg-white dark:bg-slate-800">
                                             <option value="" disabled {{ $edit->estimated_minutes === null ? 'selected' : '' }}>Select minutes</option>
-                                            @foreach($presets as $p)
-                                                <option value="{{ $p }}" {{ $edit->estimated_minutes == $p ? 'selected' : '' }}>{{ $p }} min</option>
-                                            @endforeach
+                                        @foreach($presets as $p)
+                                            <option value="{{ $p }}" {{ $edit->estimated_minutes == $p ? 'selected' : '' }}>{{ $p }} min</option>
+                                        @endforeach
                                             <option value="custom" {{ $edit->estimated_minutes && ! in_array($edit->estimated_minutes, $presets, true) ? 'selected' : '' }}>Custom</option>
-                                        </select>
-                                        <input type="number" name="custom_minutes" min="1" max="999" value="{{ $edit->estimated_minutes && !in_array($edit->estimated_minutes, $presets) ? $edit->estimated_minutes : '' }}" placeholder="min" class="w-14 text-xs px-2 py-1 rounded border border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] bg-white dark:bg-slate-800">
-                                        <button type="submit" class="text-xs px-2 py-1 rounded bg-slate-200 dark:bg-slate-600 hover:bg-slate-300 dark:hover:bg-slate-500">Set</button>
-                                    </form>
+                                    </select>
+                                    <input type="number" name="custom_minutes" min="1" max="999" value="{{ $edit->estimated_minutes && !in_array($edit->estimated_minutes, $presets) ? $edit->estimated_minutes : '' }}" placeholder="min" class="w-14 text-xs px-2 py-1 rounded border border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] bg-white dark:bg-slate-800">
+                                    <button type="submit" class="text-xs px-2 py-1 rounded bg-slate-200 dark:bg-slate-600 hover:bg-slate-300 dark:hover:bg-slate-500">Set</button>
+                                </form>
                                 @elseif($edit->estimated_minutes !== null)
                                     <p class="mt-1 max-w-[14rem] text-[10px] leading-snug text-slate-500 dark:text-slate-400">Only Admin or Manager can change estimated time after it is set.</p>
                                 @endif
@@ -534,12 +854,12 @@
                                 @else
                                     <span class="text-slate-400">—</span>
                                 @endif
-                            @endif
+                                @endif
                             @endif
                         </td>
                         <td class="px-3 py-2.5 text-xs align-top">
-                            @if($isFrameLine)
-                                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-teal-100 dark:bg-teal-900/30 text-teal-900 dark:text-teal-100">FRAME — framing only</span>
+                            @if(!$edit->needsEditWorkflow())
+                                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded {{ $lineTokens['badge'] }}">{{ $isPrintOnlyLine ? 'Print only — no editing' : 'Done only — no edit/print' }}</span>
                             @else
                             <div class="flex flex-col gap-0.5">
                                 <div>
@@ -595,36 +915,43 @@
                             @endif
                         </td>
                         <td class="px-3 py-2.5 align-top">
-                            @if($isFrameLine)
+                            @if(!$edit->needsEditWorkflow())
                                 <span class="text-xs text-slate-400">—</span>
                             @elseif($canStartEditing)
                                 <span class="text-slate-500 dark:text-slate-400 text-xs">Set est. time &amp; Start editing in Est. time column</span>
                             @elseif($canChangeStatus)
                                 @if($canEdit)
                                     @if($canUseEditorActions)
-                                        <form action="{{ route('jobs.edits.sent-to-customer', [$job, $edit]) }}" method="POST" class="inline-block mb-1 mr-1">
+                                    <form action="{{ route('jobs.edits.sent-to-customer', [$job, $edit]) }}" method="POST" class="inline-block mb-1 mr-1">
+                                        @csrf
+                                        <button type="submit" class="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200 hover:bg-blue-200 dark:hover:bg-blue-800/40">
+                                            {{ $edit->sent_to_customer_count + 1 }}# Sent to Customer Review
+                                        </button>
+                                    </form>
+                                    <form action="{{ route('jobs.edits.reedit', [$job, $edit]) }}" method="POST" class="inline-block mb-1 mr-1">
+                                        @csrf
+                                        <button type="submit" class="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 hover:bg-amber-200 dark:hover:bg-amber-800/40">
+                                            {{ $edit->reedit_count + 1 }}# Re-Edit
+                                        </button>
+                                    </form>
+                                    <form action="{{ route('jobs.edits.customer-confirm', [$job, $edit]) }}" method="POST" class="inline-block mb-1 mr-1">
+                                        @csrf
+                                        <button type="submit" class="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 hover:bg-amber-200 dark:hover:bg-amber-800/40">
+                                            Customer Confirm
+                                        </button>
+                                    </form>
+                                    @if(!$edit->edit_done_at)
+                                        <form action="{{ route('jobs.edits.edit-done', [$job, $edit]) }}" method="POST" class="inline-block mb-1 mr-1">
                                             @csrf
-                                            <button type="submit" class="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200 hover:bg-blue-200 dark:hover:bg-blue-800/40">
-                                                {{ $edit->sent_to_customer_count + 1 }}# Sent to Customer Review
+                                            <button type="submit" class="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded bg-emerald-100 dark:bg-emerald-900/30 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-200 dark:hover:bg-emerald-800/40">
+                                                Edit Done
                                             </button>
                                         </form>
-                                        <form action="{{ route('jobs.edits.reedit', [$job, $edit]) }}" method="POST" class="inline-block mb-1 mr-1">
-                                            @csrf
-                                            <button type="submit" class="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 hover:bg-amber-200 dark:hover:bg-amber-800/40">
-                                                {{ $edit->reedit_count + 1 }}# Re-Edit
-                                            </button>
-                                        </form>
-                                        <form action="{{ route('jobs.edits.customer-confirm', [$job, $edit]) }}" method="POST" class="inline-block mb-1 mr-1">
-                                            @csrf
-                                            <button type="submit" class="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 hover:bg-amber-200 dark:hover:bg-amber-800/40">
-                                                Customer Confirm
-                                            </button>
-                                        </form>
-                                        @if(!$edit->edit_done_at)
-                                            <form action="{{ route('jobs.edits.edit-done', [$job, $edit]) }}" method="POST" class="inline-block mb-1 mr-1">
+                                        @elseif($canRevertEditDone)
+                                            <form action="{{ route('jobs.edits.edit-done-clear', [$job, $edit]) }}" method="POST" class="inline-block mb-1 mr-1" onsubmit="return confirm('Clear Edit Done for this item?');">
                                                 @csrf
-                                                <button type="submit" class="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded bg-emerald-100 dark:bg-emerald-900/30 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-200 dark:hover:bg-emerald-800/40">
-                                                    Edit Done
+                                                <button type="submit" class="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded border border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-100">
+                                                    Clear Edit Done
                                                 </button>
                                             </form>
                                         @endif
@@ -637,9 +964,9 @@
                             @endif
                         </td>
                         <td class="px-3 py-2.5 text-xs align-top">
-                            @if($isFrameLine)
+                            @if(!$edit->needsPrintWorkflow())
                                 <span class="text-slate-500 dark:text-slate-400">Not applicable</span>
-                            @elseif($edit->edit_done_at)
+                            @elseif($isPrintOnlyLine || $edit->edit_done_at)
                                 <div class="flex flex-col gap-0.5">
                                     <div>
                                         <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded
@@ -683,41 +1010,37 @@
                             @endif
                         </td>
                         <td class="px-3 py-2.5 align-top">
-                            @if($isFrameLine)
+                            @if(!$edit->needsPrintWorkflow())
                                 <span class="text-xs text-slate-400">—</span>
-                            @elseif($edit->edit_done_at && auth()->user()->canUpdatePrintStatus())
+                            @elseif($viewOnlyJobAccess)
+                                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium
+                                    {{ in_array($edit->print_status, ['printed', 'not_required'], true) ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-800 dark:text-emerald-200' : 'bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200' }}">
+                                    {{ $snapshotPrintLabel($edit) }}
+                                </span>
+                            @elseif($canApplyPrint)
                                 <div class="flex flex-wrap gap-1">
+                                    @foreach(['not_required' => 'Not required', 'pending' => 'Pending', 'sent_to_print' => 'Sent to print', 'printed' => 'Printed'] as $printValue => $printLabel)
+                                        @if($canSetPrintStatus($printValue) && $edit->print_status !== $printValue)
                                     <form action="{{ route('jobs.edits.print-status', [$job, $edit]) }}" method="POST" class="inline-block">
                                         @csrf
-                                        <input type="hidden" name="print_status" value="not_required">
-                                        <button type="submit" class="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-600">
-                                            Not required
+                                                <input type="hidden" name="print_status" value="{{ $printValue }}">
+                                                <button type="submit" class="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded
+                                                    {{ $printValue === 'printed' ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-200 dark:hover:bg-emerald-800/40' : '' }}
+                                                    {{ $printValue === 'pending' ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 hover:bg-amber-200 dark:hover:bg-amber-800/40' : '' }}
+                                                    {{ $printValue === 'sent_to_print' ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200 hover:bg-blue-200 dark:hover:bg-blue-800/40' : '' }}
+                                                    {{ $printValue === 'not_required' ? 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-600' : '' }}">
+                                                    {{ $printLabel }}
                                         </button>
                                     </form>
-                                    <form action="{{ route('jobs.edits.print-status', [$job, $edit]) }}" method="POST" class="inline-block">
-                                        @csrf
-                                        <input type="hidden" name="print_status" value="pending">
-                                        <button type="submit" class="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 hover:bg-amber-200 dark:hover:bg-amber-800/40">
-                                            Pending
-                                        </button>
-                                    </form>
-                                    <form action="{{ route('jobs.edits.print-status', [$job, $edit]) }}" method="POST" class="inline-block">
-                                        @csrf
-                                        <input type="hidden" name="print_status" value="sent_to_print">
-                                        <button type="submit" class="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200 hover:bg-blue-200 dark:hover:bg-blue-800/40">
-                                            Sent to print
-                                        </button>
-                                    </form>
-                                    <form action="{{ route('jobs.edits.print-status', [$job, $edit]) }}" method="POST" class="inline-block">
-                                        @csrf
-                                        <input type="hidden" name="print_status" value="printed">
-                                        <button type="submit" class="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded bg-emerald-100 dark:bg-emerald-900/30 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-200 dark:hover:bg-emerald-800/40">
-                                            Printed
-                                        </button>
-                                    </form>
+                                        @endif
+                                    @endforeach
                                 </div>
+                            @elseif(auth()->user()->framingMustTakeJobBeforeWorkOn($job) && $edit->needsPrintWorkflow())
+                                <span class="text-xs text-amber-800 dark:text-amber-200/90" title="Use Take this job in Actions">Take job first</span>
+                            @elseif($edit->hasPrintDone() && ! auth()->user()->canManageWorkflowReversals())
+                                <span class="text-xs text-slate-500 dark:text-slate-400">Print Done — contact Admin/Manager to reverse</span>
                             @else
-                                @if(!$edit->edit_done_at)
+                                @if($isEditPrintLine && !$edit->edit_done_at)
                                     <span class="text-xs text-slate-400" title="Mark Edit Done first">Edit must be done first</span>
                                 @else
                                     <span class="text-xs text-slate-400">—</span>
@@ -725,30 +1048,32 @@
                             @endif
                         </td>
                         <td class="px-3 py-2.5 text-xs align-top">
-                            @if($edit->framing_done_at)
+                            @if(!$edit->needsDoneWorkflow())
+                                <span class="text-slate-400">Not applicable</span>
+                            @elseif($edit->framing_done_at)
                                 <div>
-                                    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-teal-600 text-white dark:bg-teal-300 dark:text-teal-900">Framing done</span>
+                                    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-teal-600 text-white dark:bg-teal-300 dark:text-teal-900">Done</span>
                                     <span class="text-slate-500 dark:text-slate-400 block mt-0.5">{{ $edit->framing_done_at->format('M j, H:i') }}</span>
                                     @if(auth()->user()->isAdmin() || auth()->user()->isManager())
-                                        <form action="{{ route('jobs.edits.framing-done-clear', [$job, $edit]) }}" method="POST" class="mt-1" onsubmit="return confirm('Clear framing done for this item?');">
+                                        <form action="{{ route('jobs.edits.framing-done-clear', [$job, $edit]) }}" method="POST" class="mt-1" onsubmit="return confirm('Clear Done for this item?');">
                                             @csrf
                                             <button type="submit" class="text-xs text-slate-500 hover:text-red-600 underline">Clear</button>
                                         </form>
                                     @endif
                                 </div>
-                            @elseif((auth()->user()->isFraming() || auth()->user()->isAdmin()) && !$edit->framing_done_at)
-                                @php
-                                    $framingReady = $isFrameLine || $edit->print_status === \App\Models\JobEdit::PRINT_STATUS_PRINTED;
-                                @endphp
+                            @elseif($viewOnlyJobAccess)
+                                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-900/30 text-xs font-medium text-amber-900 dark:text-amber-100">Pending</span>
+                            @elseif(auth()->user()->framingMustTakeJobBeforeWorkOn($job) && $edit->needsDoneWorkflow())
+                                <span class="text-xs text-amber-800 dark:text-amber-200/90" title="Use Take this job in Actions">Take job first</span>
+                            @elseif(auth()->user()->canMarkFramingDone($edit))
                                 <form action="{{ route('jobs.edits.framing-done', [$job, $edit]) }}" method="POST" class="inline-block">
                                     @csrf
                                     <button
                                         type="submit"
-                                        @unless($framingReady) disabled @endunless
-                                        class="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded border border-teal-200 dark:border-teal-800 bg-teal-100 dark:bg-teal-900/30 text-teal-800 dark:text-teal-200 hover:bg-teal-200 dark:hover:bg-teal-800/40 disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none disabled:hover:bg-teal-100 dark:disabled:hover:bg-teal-900/30"
-                                        title="{{ $framingReady ? 'Mark framing complete for this item' : 'Available after print status is Printed (not required for FRAME category)' }}"
+                                        class="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded border border-teal-200 dark:border-teal-800 bg-teal-100 dark:bg-teal-900/30 text-teal-800 dark:text-teal-200 hover:bg-teal-200 dark:hover:bg-teal-800/40"
+                                        title="Mark this done-only category line as complete"
                                     >
-                                        Framing done
+                                        Done
                                     </button>
                                 </form>
                             @else
@@ -765,14 +1090,17 @@
                         </span>
                     </td></tr>
                 @endforelse
-                    </tbody>
-                </table>
-            </div>
+            </tbody>
+        </table>
+    </div>
         </div>
+        @if($showBulkJobItemsBar)
+            <div class="h-44 shrink-0 sm:h-40" aria-hidden="true"></div>
+        @endif
     </section>
 
     @if($showBulkJobItemsBar)
-        <form id="job-edits-bulk-form" action="{{ route('jobs.edits.bulk', $job) }}" method="POST" class="fixed bottom-0 left-0 right-0 z-30 border-t border-slate-200/90 bg-white/95 px-3 py-2.5 shadow-[0_-6px_24px_rgba(0,0,0,0.08)] backdrop-blur-md dark:border-slate-700 dark:bg-slate-900/95 dark:shadow-[0_-6px_24px_rgba(0,0,0,0.35)]">
+        <form id="job-edits-bulk-form" action="{{ route('jobs.edits.bulk', $job) }}" method="POST" class="fixed bottom-0 left-0 right-0 z-30 border-t border-slate-200/90 bg-white/95 px-3 py-2.5 pb-[max(0.625rem,env(safe-area-inset-bottom))] shadow-[0_-6px_24px_rgba(0,0,0,0.08)] backdrop-blur-md dark:border-slate-700 dark:bg-slate-900/95 dark:shadow-[0_-6px_24px_rgba(0,0,0,0.35)]">
             @csrf
             <div class="mx-auto flex max-w-6xl flex-col gap-2.5 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:gap-3">
                 <div class="flex min-w-0 flex-1 flex-col gap-1 text-sm text-slate-700 dark:text-slate-200">
@@ -780,7 +1108,7 @@
                         <span class="inline-flex items-center gap-1.5 rounded-md bg-slate-100 px-2 py-1 text-xs font-semibold uppercase tracking-wide text-slate-600 dark:bg-slate-800 dark:text-slate-300">Bulk</span>
                         <span id="job-bulk-count" class="tabular-nums font-medium text-slate-600 dark:text-slate-300">0 selected</span>
                     </div>
-                    <p class="max-w-xl text-[11px] leading-snug text-slate-500 dark:text-slate-400">Applies only to lines that qualify (e.g. print after Edit Done; editor steps need est. time and a claimed line unless you are Admin). Estimated minutes: each line can be set once by editors; only Admin/Manager can change them later (including bulk). Other selected lines are skipped.</p>
+                    <p class="max-w-xl text-[11px] leading-snug text-slate-500 dark:text-slate-400">Applies only to lines that qualify (e.g. print after Edit Done; editor steps need est. time and a claimed line unless you are Admin). Reversing Edit Done or Print Done (Printed / Not required) is Admin/Manager only. Estimated minutes: each line can be set once by editors; only Admin/Manager can change them later (including bulk). Other selected lines are skipped.</p>
                 </div>
                 <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-2">
                     <label class="flex items-center gap-2 text-xs font-medium text-slate-600 dark:text-slate-400 sm:text-sm">
@@ -789,21 +1117,21 @@
                             @if($bulkCanPrint)
                                 <option value="print_status">Set print status…</option>
                             @endif
-                            @if($bulkCanTime && $bulkHasNonFrameLines)
+                            @if($bulkCanTime && $bulkHasEditPrintLines)
                                 <option value="set_estimated_minutes">Set estimated time</option>
                                 <option value="claim_start">Claim &amp; start editing</option>
                             @endif
-                            @if($bulkCanEditorPipeline && $bulkHasNonFrameLines)
+                            @if($bulkCanEditorPipeline && $bulkHasEditPrintLines)
                                 <option value="sent_to_customer">Editor: sent to customer (next #)</option>
                                 <option value="reedit">Editor: re-edit (next #)</option>
                                 <option value="customer_confirm">Editor: customer confirm</option>
                                 <option value="edit_done">Editor: mark edit done</option>
                             @endif
                             @if($bulkCanFramingDone)
-                                <option value="framing_done">Mark framing done</option>
+                                <option value="framing_done">Mark done (framing categories)</option>
                             @endif
                             @if($bulkCanFramingClear)
-                                <option value="framing_clear">Clear framing done</option>
+                                <option value="framing_clear">Clear done (framing categories)</option>
                             @endif
                         </select>
                     </label>
@@ -817,7 +1145,7 @@
                             <option value="printed">Printed</option>
                         </select>
                     </label>
-                    @if($bulkCanTime && $bulkHasNonFrameLines)
+                    @if($bulkCanTime && $bulkHasEditPrintLines)
                     <div id="job-bulk-time-wrap" class="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-2">
                         <label class="flex items-center gap-2 text-xs font-medium text-slate-600 dark:text-slate-400 sm:text-sm">
                             <span class="shrink-0">Minutes</span>
@@ -946,7 +1274,7 @@
                         }
                     }
                     if (actionSel && actionSel.value === 'framing_clear') {
-                        if (!confirm('Clear framing done for the selected lines?')) e.preventDefault();
+                        if (!confirm('Clear Done for the selected framing-category lines?')) e.preventDefault();
                     }
                 });
             })();
@@ -985,16 +1313,21 @@
         </details>
     @endif
 
-    {{-- Line snapshot + Activity log (fresh from DB each load; snapshot matches workflow columns above) --}}
-    <div class="mt-10 grid lg:grid-cols-2 gap-6 items-start">
+    {{-- Bottom page content: extra padding when fixed bulk bar is shown so nothing sits underneath it --}}
+    <div @class([
+        'mt-10 space-y-10',
+        'pb-48 sm:pb-44' => $showBulkJobItemsBar,
+        'pb-8' => ! $showBulkJobItemsBar,
+    ])>
+    <div class="grid lg:grid-cols-2 gap-6 items-start">
         <div class="rounded-xl border border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] bg-[var(--color-studio-bg-card)] dark:bg-[var(--color-studio-dark-card)] shadow-sm overflow-hidden order-2 lg:order-1">
             <div class="px-4 py-3 border-b border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] flex flex-wrap items-center justify-between gap-2 bg-slate-50/80 dark:bg-slate-800/40">
                 <h2 class="text-base font-semibold text-slate-800 dark:text-slate-100 flex items-center gap-2">
                     @include('components.icons', ['name' => 'squares-2x2', 'class' => 'w-5 h-5 text-[var(--color-studio-primary)]'])
                     Line snapshot
-                </h2>
+            </h2>
                 <span class="text-xs font-medium text-slate-500 dark:text-slate-400">{{ $visibleEdits->count() }} line(s)</span>
-            </div>
+                            </div>
             <div class="max-h-[22rem] overflow-y-auto overflow-x-auto">
                 @if($visibleEdits->isEmpty())
                     <p class="p-4 text-sm text-slate-500">No items to show.</p>
@@ -1007,10 +1340,10 @@
                                 <th class="text-left p-3 font-medium text-slate-600 dark:text-slate-300">State</th>
                                 <th class="text-left p-3 font-medium text-slate-600 dark:text-slate-300">Print</th>
                                 <th class="text-left p-3 font-medium text-slate-600 dark:text-slate-300">Framing</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            @foreach($visibleEdits as $edit)
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach($visibleEdits as $edit)
                                 <tr class="border-t border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] hover:bg-slate-50/60 dark:hover:bg-slate-800/40">
                                     <td class="p-3 font-medium text-slate-800 dark:text-slate-100">{{ $edit->name }}</td>
                                     <td class="p-3 text-slate-600 dark:text-slate-400">{{ $edit->category_name ?? '—' }}</td>
@@ -1028,13 +1361,13 @@
                                             @endif">{{ $snapshotPrintLabel($edit) }}</span>
                                     </td>
                                     <td class="p-3 text-xs text-slate-600 dark:text-slate-400">{{ $snapshotFramingLabel($edit) }}</td>
-                                </tr>
-                            @endforeach
-                        </tbody>
-                    </table>
+                            </tr>
+                        @endforeach
+                    </tbody>
+                </table>
                 @endif
             </div>
-            <p class="px-4 py-2 text-xs text-slate-500 dark:text-slate-400 border-t border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)]">Updates every time you reload or after an action. FRAME lines only use framing.</p>
+            <p class="px-4 py-2 text-xs text-slate-500 dark:text-slate-400 border-t border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)]">Updates every time you reload or after an action. Workflow follows POS category (edit + print, or framing only).</p>
         </div>
 
         <div class="rounded-xl border border-[var(--color-studio-border)] dark:border-[var(--color-studio-dark-border)] bg-[var(--color-studio-bg-card)] dark:bg-[var(--color-studio-dark-card)] shadow-sm overflow-hidden order-1 lg:order-2">
@@ -1075,5 +1408,22 @@
                 @endforelse
             </div>
         </div>
+    </div>
+
+    @if($currentUser->canSeeFullJobItemNamesSummary())
+        @php
+            $allJobItemNames = $job->edits
+                ->sortBy('sort_order')
+                ->map(fn ($edit) => trim((string) ($edit->name ?? '')) ?: '—')
+                ->values()
+                ->all();
+        @endphp
+        @if(count($allJobItemNames) > 0)
+            <section aria-labelledby="all-job-items-heading">
+                <h2 id="all-job-items-heading" class="sr-only">All job items</h2>
+                <x-job-all-item-names :names="$allJobItemNames" />
+            </section>
+        @endif
+    @endif
     </div>
 @endsection

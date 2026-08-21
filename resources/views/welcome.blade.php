@@ -52,7 +52,7 @@
         <div class="flex items-center justify-center w-full transition-opacity opacity-100 duration-750 lg:grow starting:opacity-0">
             <main class="flex max-w-[335px] w-full flex-col-reverse lg:max-w-4xl lg:flex-row">
                 <div class="text-[13px] leading-[20px] flex-1 p-6 pb-12 lg:p-20 bg-[var(--color-studio-bg-card)] dark:bg-[var(--color-studio-dark-card)] dark:text-slate-200 shadow-[inset_0px_0px_0px_1px_var(--color-studio-border)] dark:shadow-[inset_0px_0px_0px_1px_var(--color-studio-dark-border)] rounded-bl-lg rounded-br-lg lg:rounded-tl-lg lg:rounded-br-none">
-                    <h1 class="mb-1 font-medium text-[var(--color-studio-primary)] dark:text-[var(--color-studio-accent)]">Studio Salaru Internal Job Management System</h1>
+                    <h1 class="mb-1 font-medium text-[var(--color-studio-primary)] dark:text-[var(--color-studio-accent)]">{{ config('app.name', 'Studio Salaru Job Management') }}</h1>
                     <p class="mb-2 text-[var(--color-studio-muted)] dark:text-slate-400">Let's get started. <br>Manage jobs and tasks in one place.</p>
                     <ul class="flex flex-col mb-4 lg:mb-6">
                         <li class="flex items-center gap-4 py-2 relative before:border-l before:border-[var(--color-studio-border)] dark:before:border-[var(--color-studio-dark-border)] before:top-1/2 before:bottom-0 before:left-[0.4rem] before:absolute">

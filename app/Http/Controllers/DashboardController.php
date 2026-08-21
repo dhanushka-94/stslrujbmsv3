@@ -5,13 +5,20 @@ namespace App\Http\Controllers;
 use App\Models\ActivityLog;
 use App\Models\Job;
 use App\Models\JobEdit;
+use App\Support\CategoryWorkflow;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\View\View;
 
 class DashboardController extends Controller
 {
-    public function __invoke(): View
+    public function __invoke(): View|RedirectResponse
     {
         $user = auth()->user();
+
+        if ($user->usesJobsAndJobPoolNavOnly()) {
+            return redirect()->route('jobs.index');
+        }
 
         if ($user->isAdmin() || $user->isManager()) {
             $stats = [
@@ -54,24 +61,36 @@ class DashboardController extends Controller
         }
 
         if ($user->isPrinter()) {
+            $printerLineScope = fn (Builder $q) => CategoryWorkflow::scopePrintWorkflowCategory($q, 'category_name');
             $editsPendingPrint = JobEdit::whereIn('print_status', [
                 JobEdit::PRINT_STATUS_PENDING,
                 JobEdit::PRINT_STATUS_SENT_TO_PRINT,
-            ])->with('job')->orderBy('updated_at', 'desc')->take(20)->get();
+            ])
+                ->where($printerLineScope)
+                ->with('job')
+                ->orderBy('updated_at', 'desc')
+                ->take(20)
+                ->get();
             $pendingCount = JobEdit::whereIn('print_status', [
                 JobEdit::PRINT_STATUS_PENDING,
                 JobEdit::PRINT_STATUS_SENT_TO_PRINT,
-            ])->count();
+            ])
+                ->where($printerLineScope)
+                ->count();
             $printedToday = JobEdit::where('print_status', JobEdit::PRINT_STATUS_PRINTED)
-                ->whereDate('updated_at', today())->count();
+                ->where($printerLineScope)
+                ->whereDate('updated_at', today())
+                ->count();
+
             return view('dashboard.printer', compact('editsPendingPrint', 'pendingCount', 'printedToday'));
         }
 
-        if ($user->isSales() || $user->isDelivery()) {
+        if ($user->isDelivery()) {
             $readyForDelivery = Job::where('status', Job::STATUS_COMPLETED)->with('editor')->latest()->take(15)->get();
             $readyCount = Job::where('status', Job::STATUS_COMPLETED)->count();
             $deliveredToday = Job::where('status', Job::STATUS_DELIVERED)->where('delivered_by', $user->id)
                 ->whereDate('delivered_at', today())->count();
+
             return view('dashboard.cashier', compact('readyForDelivery', 'readyCount', 'deliveredToday'));
         }
 

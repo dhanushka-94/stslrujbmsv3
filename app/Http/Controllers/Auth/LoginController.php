@@ -44,7 +44,7 @@ class LoginController extends Controller
 
         ActivityLog::log('login', $user->name . ' logged in');
 
-        return redirect()->intended(route('dashboard', absolute: false));
+        return redirect()->intended(route($user->homeRouteName(), absolute: false));
     }
 
     public function logout(Request $request): RedirectResponse

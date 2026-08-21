@@ -9,10 +9,17 @@ use App\Models\Job;
 use App\Models\BlockedCategory;
 use App\Models\BlockedProduct;
 use App\Models\JobEdit;
+use App\Models\JobPosApplyHistory;
 use App\Models\User;
+use App\Support\CategoryAppearance;
+use App\Support\CategoryWorkflow;
+use App\Support\JobPoolEligibility;
+use App\Support\PosJobLineDrift;
+use App\Support\PosUpdatedBadge;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
@@ -108,7 +115,7 @@ class JobController extends Controller
 
         // Ensure job items (edits) are present for this job based on POS sale items.
         try {
-            $this->syncSaleItemsFromSource($conn, $job, (int) $sale->id);
+        $this->syncSaleItemsFromSource($conn, $job, (int) $sale->id);
         } catch (\Throwable $e) {
             Log::error('syncSaleItemsFromSource failed', [
                 'job_id' => $job->id,
@@ -129,8 +136,47 @@ class JobController extends Controller
             $job->id
         );
 
+        $user = auth()->user();
+        if ($user && $user->canTakeJob()) {
+            $job->loadMissing(['editors', 'edits']);
+            $isAlreadyOnJob = $user->isAssignedToStudioJob($job);
+            $editableLineCount = $job->edits
+                ->filter(fn (JobEdit $edit) => $edit->needsEditWorkflow())
+                ->count();
+            $canJoinExistingMultiEditJob = ! $isAlreadyOnJob
+                && $editableLineCount > 1
+                && in_array($job->status, [Job::STATUS_NEW, Job::STATUS_ASSIGNED, Job::STATUS_IN_PROGRESS], true);
+
+            if ($canJoinExistingMultiEditJob) {
+                $job->editors()->syncWithoutDetaching([$user->id]);
+                if (! $job->assigned_editor_id) {
+                    $job->update(['assigned_editor_id' => $user->id]);
+                }
+                if ($job->status === Job::STATUS_NEW) {
+                    $job->update(['status' => Job::STATUS_ASSIGNED]);
+                }
+                ActivityLog::log(
+                    'job_editor_added_from_pool',
+                    'Joined job ' . $job->ref_number . ' from Job Pool as an additional editor',
+                    'job',
+                    $job->id
+                );
+                $job->refresh();
+
         return redirect()->route('jobs.show', $job)
-            ->with('success', 'Job opened from Job Pool. You can now Take or Dismiss this job.');
+                    ->with('success', 'You joined this multi-line job and can start editing assigned lines.');
+            }
+        }
+
+        $openMessage = match (true) {
+            $user && $user->role === User::ROLE_FRAMING
+                => 'Job opened from Job Pool. Take this job before marking framing items done.',
+            $user && $user->role === User::ROLE_PRINTER_FRAMING
+                => 'Job opened from Job Pool. Take this job before updating print or framing status.',
+            default => 'Job opened from Job Pool. You can now Take or Dismiss this job.',
+        };
+
+        return redirect()->route('jobs.show', $job)->with('success', $openMessage);
     }
 
     /**
@@ -164,8 +210,31 @@ class JobController extends Controller
         }
 
         $existing = $job->edits()->orderBy('sort_order')->get();
+        $usedEditIds = [];
         foreach ($rows as $sortOrder => $row) {
-            $edit = $existing->firstWhere('sort_order', $sortOrder);
+            $saleItemId = isset($row['source_sale_item_id']) ? (int) $row['source_sale_item_id'] : 0;
+            $unitIndex = (int) ($row['source_quantity_unit_index'] ?? 1);
+
+            $edit = null;
+            if ($saleItemId > 0) {
+                $edit = $existing->first(function ($e) use ($saleItemId, $unitIndex, $usedEditIds) {
+                    if (in_array($e->id, $usedEditIds, true)) {
+                        return false;
+                    }
+                    if ((int) ($e->source_sale_item_id ?? 0) !== $saleItemId) {
+                        return false;
+                    }
+                    $editUnit = (int) ($e->source_quantity_unit_index ?? 1);
+
+                    return $editUnit === $unitIndex;
+                });
+            }
+            if (! $edit) {
+                $edit = $existing->first(function ($e) use ($sortOrder, $usedEditIds) {
+                    return ! in_array($e->id, $usedEditIds, true) && (int) $e->sort_order === (int) $sortOrder;
+                });
+            }
+
             $payload = JobEdit::attributesForExistingColumns([
                 'name' => $row['name'],
                 'source_product_id' => $row['source_product_id'],
@@ -181,12 +250,126 @@ class JobController extends Controller
             ]);
             if ($edit) {
                 $edit->update($payload);
+                $usedEditIds[] = $edit->id;
             } else {
-                $job->edits()->create($payload);
+                $created = $job->edits()->create($payload);
+                $usedEditIds[] = $created->id;
             }
         }
-        $maxOrder = count($rows) - 1;
-        $job->edits()->where('sort_order', '>', $maxOrder)->delete();
+        if ($usedEditIds !== []) {
+            $job->edits()->whereNotIn('id', $usedEditIds)->delete();
+        } else {
+            $maxOrder = count($rows) - 1;
+            $job->edits()->where('sort_order', '>', $maxOrder)->delete();
+        }
+    }
+
+    public function resyncFromPos(Job $job): RedirectResponse
+    {
+        $user = auth()->user();
+        if (! $user || ! $user->canModifyJobWorkflow()) {
+            abort(403);
+        }
+        if (empty($job->source_id)) {
+            return redirect()->route('jobs.show', $job)->with('error', 'This job is not linked to a POS sale.');
+        }
+
+        $conn = 'source';
+        if (empty(config("database.connections.{$conn}.database"))) {
+            return redirect()->route('jobs.show', $job)->with('error', 'Source database not configured.');
+        }
+
+        try {
+            $sale = DB::connection($conn)->table('sma_sales')->where('id', (int) $job->source_id)->first();
+        } catch (\Throwable $e) {
+            return redirect()->route('jobs.show', $job)->with('error', 'Cannot read POS sale: '.$e->getMessage());
+        }
+
+        if (! $sale) {
+            return redirect()->route('jobs.show', $job)->with('error', 'Linked POS sale was not found.');
+        }
+
+        $job->load(['edits' => fn ($q) => $q->orderBy('sort_order')]);
+        $beforeRows = PosJobLineDrift::rowsFromJob($job);
+
+        try {
+            $saleItems = DB::connection($conn)
+                ->table('sma_sale_items')
+                ->where('sale_id', (int) $sale->id)
+                ->orderBy('id')
+                ->get();
+        } catch (\Throwable $e) {
+            return redirect()->route('jobs.show', $job)->with('error', 'Cannot read POS sale items: '.$e->getMessage());
+        }
+
+        $posRows = PosJobLineDrift::rowsFromPosSaleItems($conn, $saleItems);
+        $cmpBefore = PosJobLineDrift::compare($job, $posRows);
+
+        $dueDate = isset($sale->due_date) && $sale->due_date !== '0000-00-00'
+            ? $sale->due_date
+            : null;
+        $paymentStatus = strtolower((string) ($sale->payment_status ?? ''));
+        $isActive = in_array($paymentStatus, ['pending', 'due', 'partial', 'unpaid'], true);
+
+        $job->update([
+            'customer_name' => $sale->customer ?? $job->customer_name,
+            'due_date' => $dueDate,
+            'is_active' => $isActive,
+            'notes' => $sale->note ?? $job->notes,
+        ]);
+
+        try {
+            $this->syncSaleItemsFromSource($conn, $job, (int) $sale->id);
+        } catch (\Throwable $e) {
+            Log::error('resyncFromPos failed', [
+                'job_id' => $job->id,
+                'message' => $e->getMessage(),
+            ]);
+
+            return redirect()->route('jobs.show', $job)->with('error', 'Could not sync lines from POS.');
+        }
+
+        $job->refresh();
+        $job->load(['edits' => fn ($q) => $q->orderBy('sort_order')]);
+        $afterRows = PosJobLineDrift::rowsFromJob($job);
+
+        $posCreatedRaw = $this->normalizePosTimestampRaw($sale->date ?? null);
+        $posUpdatedRaw = $this->normalizePosTimestampRaw($sale->updated_at ?? null);
+
+        try {
+            if (Schema::hasTable('job_pos_apply_histories')) {
+                JobPosApplyHistory::create([
+                    'studio_job_id' => $job->id,
+                    'applied_by' => auth()->id(),
+                    'applied_at' => now(),
+                    'pos_sale_created_at' => $posCreatedRaw,
+                    'pos_sale_updated_at' => $posUpdatedRaw,
+                    'summary' => $cmpBefore['summary'] ?? 'POS lines applied',
+                    'previous_lines' => array_map(fn (array $r) => PosJobLineDrift::displayRow($r), $beforeRows),
+                    'new_lines' => array_map(fn (array $r) => PosJobLineDrift::displayRow($r), $afterRows),
+                    'added' => $cmpBefore['added'] ?? [],
+                    'removed' => $cmpBefore['removed'] ?? [],
+                    'changed' => $cmpBefore['changed'] ?? [],
+                ]);
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Could not store POS apply history', [
+                'job_id' => $job->id,
+                'message' => $e->getMessage(),
+            ]);
+        }
+
+        ActivityLog::log(
+            'job_resync_from_pos',
+            'Applied POS updates on job '.$job->ref_number.' ('.$cmpBefore['summary'].')',
+            'job',
+            $job->id
+        );
+
+        PosUpdatedBadge::bumpVersion();
+
+        return redirect()->route('jobs.show', $job)
+            ->with('success', 'Pending POS updates applied. Previous and new lines are saved on this job with dates.');
     }
 
     /**
@@ -201,7 +384,14 @@ class JobController extends Controller
         }
 
         $user = auth()->user();
+        if ($user->isDeliveryViewOnly()) {
+            return redirect()->route('jobs.index', ['section' => 'completed'])->with(
+                'error',
+                'Job Pool is not available for Delivery. Use the Completed jobs list to mark delivery.'
+            );
+        }
         $ref = $request->input('ref');
+        $categoryFilter = $this->resolvedCategoryFilterKey($request);
         $page = max(1, (int) $request->input('page', 1));
         $perPage = 15;
 
@@ -216,25 +406,25 @@ class JobController extends Controller
             // Printer / framing / printer+framing: show every eligible POS sale (opened or not).
             $usedSourceIds = [];
             if (! $user->usesDedicatedPrintFramingJobPool()) {
-                $startedJobQuery = Job::whereNotNull('source_id')
-                    ->whereIn('status', [
-                        Job::STATUS_ASSIGNED,
-                        Job::STATUS_IN_PROGRESS,
-                        Job::STATUS_COMPLETED,
-                        Job::STATUS_DELIVERED,
-                    ]);
+            $startedJobQuery = Job::whereNotNull('source_id')
+                ->whereIn('status', [
+                    Job::STATUS_ASSIGNED,
+                    Job::STATUS_IN_PROGRESS,
+                    Job::STATUS_COMPLETED,
+                    Job::STATUS_DELIVERED,
+                ]);
 
                 if ($user->isEditor()) {
-                    $startedJobQuery->where(function ($q) use ($user) {
-                        $q->where('assigned_editor_id', $user->id)
-                            ->orWhereHas('editors', fn ($qq) => $qq->where('user_id', $user->id));
-                    });
-                }
+                $startedJobQuery->where(function ($q) use ($user) {
+                    $q->where('assigned_editor_id', $user->id)
+                        ->orWhereHas('editors', fn ($qq) => $qq->where('user_id', $user->id));
+                });
+            }
 
-                $usedSourceIds = $startedJobQuery
-                    ->pluck('source_id')
-                    ->map(fn ($id) => (int) $id)
-                    ->all();
+            $usedSourceIds = $startedJobQuery
+                ->pluck('source_id')
+                ->map(fn ($id) => (int) $id)
+                ->all();
             }
 
             $tz = config('app.timezone');
@@ -260,28 +450,21 @@ class JobController extends Controller
                 $query->where('reference_no', 'like', '%' . $ref . '%');
             }
 
-            // For editors with category restrictions: only include sales that have at least
-            // one item in one of their allowed categories.
-            if ($user->isEditor()) {
-                $allowed = $user->assignedCategoryIds();
-                if (! empty($allowed)) {
-                    $query->whereExists(function ($q) use ($allowed, $conn) {
-                        $q->select(DB::raw(1))
-                            ->from('sma_sale_items as si')
-                            ->leftJoin('sma_products as p', 'si.product_id', '=', 'p.id')
-                            ->whereColumn('si.sale_id', 'sma_sales.id')
-                            ->whereIn('p.category_id', $allowed);
-                    });
-                }
+            if ($categoryFilter !== null) {
+                $this->applyCanonicalCategoryFilterToPosSalesQuery($query, $categoryFilter, $conn);
             }
+
+            // Hide sales with no eligible POS lines (and no eligible studio lines for printer/framing pool).
+            JobPoolEligibility::constrainSalesQuery($query, $user, $conn);
 
             // Only count and fetch once to avoid re-building the query.
             $total = (clone $query)->count();
 
             $sales = $query
-                // Soonest due date/time first, then earliest sale date.
+                // Soonest due date/time first, then earliest sale date, then sale id.
                 ->orderBy('due_date')
                 ->orderBy('date')
+                ->orderBy('id')
                 ->forPage($page, $perPage)
                 ->get([
                     'id',
@@ -290,6 +473,8 @@ class JobController extends Controller
                     'payment_status',
                     'due_date',
                     'date',
+                    'updated_at',
+                    'staff_note',
                 ]);
         } catch (\Throwable $e) {
             return redirect()->route('jobs.index')->with('error', 'Cannot read source sales: ' . $e->getMessage());
@@ -298,39 +483,44 @@ class JobController extends Controller
         // Map any existing local jobs by source_id so we can show status / links.
         $sourceIds = $sales->pluck('id')->map(fn ($id) => (string) $id)->all();
 
-        $jobsBySourceId = Job::with(['editor', 'editors'])
+        $jobsBySourceId = Job::with(['editor', 'editors', 'edits'])
             ->whereIn('source_id', $sourceIds)
             ->get()
             ->keyBy('source_id');
 
-        // Load sale items (job items) from POS for all listed sales so we can show them in Job Pool.
-        // For editors with category restrictions, only include items in their allowed categories.
+        // Load eligible sale items from POS; fall back to studio job_edits when pool row qualifies via opened job only.
         $itemsBySaleId = collect();
         $saleIds = $sales->pluck('id')->all();
         if ($saleIds !== []) {
-            try {
-                $itemsQuery = DB::connection($conn)
-                    ->table('sma_sale_items as si')
+        try {
+                $itemsBySaleId = DB::connection($conn)
+                ->table('sma_sale_items as si')
                     ->whereIn('si.sale_id', $saleIds)
-                    ->orderBy('si.id')
-                    ->leftJoin('sma_products as p', 'si.product_id', '=', 'p.id');
+                ->orderBy('si.id')
+                    ->leftJoin('sma_products as p', 'si.product_id', '=', 'p.id')
+                    ->get(['si.id', 'si.sale_id', 'si.product_name', 'si.quantity', 'si.product_id'])
+                ->groupBy('sale_id')
+                    ->map(function ($group) use ($conn, $user) {
+                        return JobPoolEligibility::eligiblePosItemLines($conn, $group->all(), $user);
+                });
+        } catch (\Throwable $e) {
+            // If POS items cannot be read, just leave itemsBySaleId empty.
+            }
 
-                // If editor has specific allowed categories, filter to those.
-                if ($user->isEditor()) {
-                    $allowed = $user->assignedCategoryIds();
-                    if (! empty($allowed)) {
-                        $itemsQuery->whereIn('p.category_id', $allowed);
-                    }
+            foreach ($sales as $sale) {
+                $saleId = (int) $sale->id;
+                $lines = $itemsBySaleId->get($saleId, []);
+                if ($lines !== []) {
+                    continue;
                 }
 
-                $itemsBySaleId = $itemsQuery
-                    ->get(['si.sale_id', 'si.product_name', 'si.quantity', 'si.product_id'])
-                    ->groupBy('sale_id')
-                    ->map(function ($group) use ($conn) {
-                        return SaleItemsJobEditsBuilder::namesForJobPool($conn, $group->all());
-                    });
-            } catch (\Throwable $e) {
-                // If POS items cannot be read, just leave itemsBySaleId empty.
+                $job = $jobsBySourceId->get((string) $saleId);
+                if ($job) {
+                    $editLines = JobPoolEligibility::eligibleJobEditLines($job, $user);
+                    if ($editLines !== []) {
+                        $itemsBySaleId->put($saleId, $editLines);
+                    }
+                }
             }
         }
 
@@ -348,17 +538,23 @@ class JobController extends Controller
         // Mark Job Pool as checked "now" for this user (used for notifications).
         if ($user && Schema::hasColumn('users', 'job_pool_last_checked_at')) {
             try {
-                $user->forceFill(['job_pool_last_checked_at' => now()])->save();
+            $user->forceFill(['job_pool_last_checked_at' => now()])->save();
             } catch (\Throwable) {
                 // Avoid 500 if DB is out of sync with migrations.
             }
         }
 
+        $allItemNamesBySaleId = $user->canSeeFullJobItemNamesSummary()
+            ? $this->buildAllItemNamesBySaleIdForJobPool($conn, $sales, $jobsBySourceId)
+            : [];
+
         return view('jobs.live', [
             'sales' => $paginator,
             'jobsBySourceId' => $jobsBySourceId,
             'itemsBySaleId' => $itemsBySaleId,
+            'allItemNamesBySaleId' => $allItemNamesBySaleId,
             'ref' => $ref,
+            'categoryFilter' => $categoryFilter,
             'jobPoolMode' => 'pos',
         ]);
     }
@@ -366,15 +562,22 @@ class JobController extends Controller
     public function index(Request $request): View|RedirectResponse
     {
         $user = auth()->user();
-        $section = $request->input('section', 'ongoing');
         $ref = $request->input('ref');
+        $categoryFilter = $this->resolvedCategoryFilterKey($request);
+        $deliveryJobsListOnly = $user->isDeliveryViewOnly();
+        $section = $request->input('section', $deliveryJobsListOnly ? 'completed' : 'ongoing');
 
-        $allowedSections = ['ongoing', 'edit_done', 'print_done', 'framing_done', 'completed', 'delivered', 'dismissed'];
+        $allowedSections = $user->allowedJobsListSections()
+            ?? ['ongoing', 'pos_updated', 'edit_done', 'print_done', 'framing_done', 'completed', 'delivered', 'dismissed'];
         if (! in_array($section, $allowedSections, true)) {
-            $section = 'ongoing';
+            return redirect()->route('jobs.index', array_filter([
+                'section' => $allowedSections[0],
+                'ref' => $ref,
+                'category' => $categoryFilter,
+            ]));
         }
 
-        $baseQuery = function () use ($ref) {
+        $baseQuery = function () use ($ref, $categoryFilter) {
             return Job::with(['editor', 'editors'])
                 ->with(['edits' => fn ($eq) => $eq
                     ->select([
@@ -387,11 +590,17 @@ class JobController extends Controller
                         'framing_done_at',
                         'source_category_id',
                         'source_product_id',
+                        'source_sale_item_id',
+                        'source_quantity_unit_index',
+                        'source_quantity_unit_total',
                         'sort_order',
                     ])
                     ->orderBy('sort_order')])
                 ->withCount('edits')
-                ->when($ref, fn ($qq) => $qq->where('ref_number', 'like', '%' . $ref . '%'));
+                ->when($ref, fn ($qq) => $qq->where('ref_number', 'like', '%' . $ref . '%'))
+                ->when($categoryFilter !== null, function ($qq) use ($categoryFilter) {
+                    $this->applyCanonicalCategoryFilterToJobsQuery($qq, $categoryFilter);
+                });
         };
 
         $scopeUserJobsIfEditor = function ($query) use ($user) {
@@ -400,7 +609,7 @@ class JobController extends Controller
             }
 
             return $query->where(function ($q) use ($user) {
-                $q->where('assigned_editor_id', $user->id)
+                    $q->where('assigned_editor_id', $user->id)
                     ->orWhereHas('editors', fn ($q2) => $q2->where('user_id', $user->id));
             });
         };
@@ -425,7 +634,7 @@ class JobController extends Controller
             // Ongoing: started jobs with any line still needing work (FRAME → framing; others → edit + print).
             $ongoingQuery = $scopeUserJobsIfEditor($baseQuery()
                 ->whereIn('status', [Job::STATUS_ASSIGNED, Job::STATUS_IN_PROGRESS]));
-            $this->scopeJobsWhereAnyEditIncomplete($ongoingQuery, $printedTerminal);
+            $this->scopeJobsWhereAnyEditIncomplete($ongoingQuery, $printedTerminal, $user);
             $editDoneTabQuery = fn () => $this->buildEditDoneTabQuery($scopeUserJobsIfEditor($baseQuery()), $printedTerminal);
             $completedQuery = $baseQuery()->where('status', Job::STATUS_COMPLETED)
                 ->where(function ($q) use ($user) {
@@ -442,7 +651,7 @@ class JobController extends Controller
             $scopePrintFraming = fn ($query) => $query->whereIn('id', $printFramingQueueIds);
             $ongoingQuery = $scopePrintFraming($baseQuery()
                 ->whereIn('status', [Job::STATUS_ASSIGNED, Job::STATUS_IN_PROGRESS]));
-            $this->scopeJobsWhereAnyEditIncomplete($ongoingQuery, $printedTerminal);
+            $this->scopeJobsWhereAnyEditIncomplete($ongoingQuery, $printedTerminal, $user);
             $editDoneTabQuery = fn () => $this->buildEditDoneTabQuery($scopePrintFraming($baseQuery()), $printedTerminal);
             $completedQuery = $baseQuery()->where('status', Job::STATUS_COMPLETED);
             $deliveredQuery = $baseQuery()->where('status', Job::STATUS_DELIVERED);
@@ -450,7 +659,7 @@ class JobController extends Controller
         } else {
             $ongoingQuery = $baseQuery()
                 ->whereIn('status', [Job::STATUS_ASSIGNED, Job::STATUS_IN_PROGRESS]);
-            $this->scopeJobsWhereAnyEditIncomplete($ongoingQuery, $printedTerminal);
+            $this->scopeJobsWhereAnyEditIncomplete($ongoingQuery, $printedTerminal, $user);
             $editDoneTabQuery = fn () => $this->buildEditDoneTabQuery($scopeUserJobsIfEditor($baseQuery()), $printedTerminal);
             $completedQuery = $baseQuery()->where('status', Job::STATUS_COMPLETED);
             $deliveredQuery = $baseQuery()->where('status', Job::STATUS_DELIVERED);
@@ -460,6 +669,29 @@ class JobController extends Controller
         $printDoneTabQuery = fn () => $this->buildPrintDoneTabQuery($scopedBaseForTabs(), $printedTerminal);
         $framingDoneTabQuery = fn () => $this->buildFramingDoneTabQuery($scopedBaseForTabs(), $printedTerminal);
 
+        $posUpdatedDriftedIds = [];
+        $posUpdatedCount = 0;
+        if (in_array('pos_updated', $allowedSections, true)) {
+            if ($section === 'pos_updated') {
+                $refreshed = PosUpdatedBadge::countAndIds($user, allowRefresh: true);
+                $posUpdatedDriftedIds = $refreshed['ids'];
+                if ($ref || $categoryFilter !== null) {
+                    $filterQ = Job::query()->whereIn('id', $posUpdatedDriftedIds ?: [0]);
+                    if ($ref) {
+                        $filterQ->where('ref_number', 'like', '%'.$ref.'%');
+                    }
+                    if ($categoryFilter !== null) {
+                        $this->applyCanonicalCategoryFilterToJobsQuery($filterQ, $categoryFilter);
+                    }
+                    $posUpdatedDriftedIds = $filterQ->pluck('id')->map(fn ($id) => (int) $id)->all();
+                }
+                $posUpdatedCount = count($posUpdatedDriftedIds);
+            } else {
+                $posUpdatedCount = PosUpdatedBadge::cachedCount($user);
+                $posUpdatedDriftedIds = PosUpdatedBadge::cachedIds($user);
+            }
+        }
+
         $ongoingCount = $ongoingQuery->count();
         $editDoneCount = $editDoneTabQuery()->count();
         $printDoneCount = $printDoneTabQuery()->count();
@@ -468,26 +700,52 @@ class JobController extends Controller
         $deliveredCount = $deliveredQuery->count();
         $dismissedCount = $dismissedQuery->count();
 
-        if ($section === 'dismissed') {
-            $jobs = $dismissedQuery->latest()->paginate(15)->withQueryString();
+        $posUpdatedMetaByJobId = [];
+        if ($section === 'pos_updated') {
+            $page = max(1, (int) $request->input('page', 1));
+            $perPage = 15;
+            $pageIds = array_slice($posUpdatedDriftedIds, ($page - 1) * $perPage, $perPage);
+            $jobsById = $pageIds === []
+                ? collect()
+                : $baseQuery()->whereIn('id', $pageIds)->get()->keyBy('id');
+            $pageJobs = collect($pageIds)->map(fn ($id) => $jobsById->get($id))->filter()->values();
+            $posUpdatedMetaByJobId = $this->posUpdatedMetaForJobs($pageJobs);
+            $jobs = new LengthAwarePaginator(
+                $pageJobs,
+                $posUpdatedCount,
+                $perPage,
+                $page,
+                [
+                    'path' => $request->url(),
+                    'query' => $request->query(),
+                ]
+            );
+        } elseif ($section === 'dismissed') {
+            $jobs = $this->paginateJobsBySoonestDue($dismissedQuery);
         } elseif ($section === 'edit_done') {
-            $jobs = $editDoneTabQuery()->latest()->paginate(15)->withQueryString();
+            $jobs = $this->paginateJobsBySoonestDue($editDoneTabQuery());
         } elseif ($section === 'print_done') {
-            $jobs = $printDoneTabQuery()->latest()->paginate(15)->withQueryString();
+            $jobs = $this->paginateJobsBySoonestDue($printDoneTabQuery());
         } elseif ($section === 'framing_done') {
-            $jobs = $framingDoneTabQuery()->latest()->paginate(15)->withQueryString();
+            $jobs = $this->paginateJobsBySoonestDue($framingDoneTabQuery());
         } elseif ($section === 'completed') {
-            $jobs = $completedQuery->latest()->paginate(15)->withQueryString();
+            $jobs = $this->paginateJobsBySoonestDue($completedQuery);
         } elseif ($section === 'delivered') {
-            $jobs = $deliveredQuery->latest()->paginate(15)->withQueryString();
+            $jobs = $this->paginateJobsBySoonestDue($deliveredQuery);
         } else {
-            // default: ongoing
-            $jobs = $ongoingQuery->latest()->paginate(15)->withQueryString();
+            // default: ongoing — soonest due date/time first
+            $jobs = $this->paginateJobsBySoonestDue($ongoingQuery);
         }
 
-        $saleDueRawBySourceId = $this->fetchPosSaleDueDateRawBySourceIds(
+        $posSaleListMeta = $this->fetchPosSaleListMetaBySourceIds(
             $jobs->getCollection()->pluck('source_id')->filter()->unique()
         );
+        $saleDueRawBySourceId = $posSaleListMeta['due'];
+        $saleStaffNoteBySourceId = $posSaleListMeta['staff_note'];
+        $salePosTimestampsBySourceId = $posSaleListMeta['timestamps'];
+
+        $jobsListSections = $user->allowedJobsListSections()
+            ?? ['ongoing', 'pos_updated', 'edit_done', 'print_done', 'framing_done', 'completed', 'delivered', 'dismissed'];
 
         return view('jobs.index', compact(
             'jobs',
@@ -499,13 +757,55 @@ class JobController extends Controller
             'completedCount',
             'deliveredCount',
             'dismissedCount',
+            'posUpdatedCount',
+            'posUpdatedMetaByJobId',
             'ref',
-            'saleDueRawBySourceId'
+            'saleDueRawBySourceId',
+            'saleStaffNoteBySourceId',
+            'salePosTimestampsBySourceId',
+            'deliveryJobsListOnly',
+            'jobsListSections',
+            'categoryFilter'
         ));
     }
 
-    public function show(Job $job): Response
+    /**
+     * Lightweight JSON badge for POS-updated count.
+     * Uses cache when fresh; otherwise scans once and caches (called after page paint via JS).
+     */
+    public function posUpdatedCount(Request $request): \Illuminate\Http\JsonResponse
     {
+        $user = auth()->user();
+        $allowed = $user->allowedJobsListSections()
+            ?? ['ongoing', 'pos_updated', 'edit_done', 'print_done', 'framing_done', 'completed', 'delivered', 'dismissed'];
+        if (! in_array('pos_updated', $allowed, true)) {
+            return response()->json(['count' => 0, 'cached' => true]);
+        }
+
+        $force = $request->boolean('refresh');
+        if ($force || ! PosUpdatedBadge::hasFreshCache($user)) {
+            $result = PosUpdatedBadge::refresh($user);
+
+            return response()->json([
+                'count' => $result['count'],
+                'cached' => false,
+            ]);
+        }
+
+        return response()->json([
+            'count' => PosUpdatedBadge::cachedCount($user),
+            'cached' => true,
+        ]);
+    }
+
+    public function show(Job $job): Response|RedirectResponse
+    {
+        $user = auth()->user();
+        if ($user && ! $user->canViewJobDetail($job)) {
+            return redirect()->route('jobs.index', ['section' => 'completed'])
+                ->with('error', 'Delivery can only open completed jobs ready for delivery.');
+        }
+
         $job->refresh();
         $job->load(['editor', 'editors', 'deliveredByUser']);
         $job->load([
@@ -514,6 +814,29 @@ class JobController extends Controller
         $this->applyPosDueDateFromSourceToJob($job);
         $this->enrichEditsWithCategoryFromSource($job);
         $this->maybeAutoCompleteJob($job);
+        $posStaffNote = $this->fetchPosSaleStaffNoteForJob($job);
+        $posSaleTimestamps = $this->fetchPosSaleTimestampsForJob($job);
+        $posSaleMissing = false;
+        $posLineDrift = null;
+        if (filled($job->source_id) && ! empty(config('database.connections.source.database'))) {
+            try {
+                $posSaleMissing = PosJobLineDrift::saleMissingForJob($job, 'source');
+                if (! $posSaleMissing) {
+                    $saleItems = DB::connection('source')
+                        ->table('sma_sale_items')
+                        ->where('sale_id', (int) $job->source_id)
+                        ->orderBy('id')
+                        ->get(['id', 'sale_id', 'product_id', 'product_name', 'quantity']);
+                    $posLineDrift = PosJobLineDrift::compare(
+                        $job,
+                        PosJobLineDrift::lightweightRowsFromPosSaleItems($saleItems)
+                    );
+                }
+            } catch (\Throwable) {
+                $posSaleMissing = false;
+                $posLineDrift = null;
+            }
+        }
         $editorsAvailable = \App\Models\User::whereIn('role', \App\Models\User::rolesAssignableAsJobEditors())->orderBy('name')->get();
         $jobActivityLog = \App\Models\ActivityLog::where('subject_type', 'job')
             ->where('subject_id', $job->id)
@@ -521,9 +844,22 @@ class JobController extends Controller
             ->orderByDesc('created_at')
             ->limit(150)
             ->get();
+        $posApplyHistories = collect();
+        if (Schema::hasTable('job_pos_apply_histories')) {
+            $posApplyHistories = $job->posApplyHistories()->with('appliedByUser')->limit(20)->get();
+        }
 
         return response()
-            ->view('jobs.show', compact('job', 'editorsAvailable', 'jobActivityLog'))
+            ->view('jobs.show', compact(
+                'job',
+                'editorsAvailable',
+                'jobActivityLog',
+                'posStaffNote',
+                'posLineDrift',
+                'posSaleTimestamps',
+                'posSaleMissing',
+                'posApplyHistories'
+            ))
             ->header('Cache-Control', 'private, no-store, no-cache, must-revalidate')
             ->header('Pragma', 'no-cache');
     }
@@ -546,96 +882,51 @@ class JobController extends Controller
         if (empty(config("database.connections.{$conn}.database"))) {
             return;
         }
-        $db = \Illuminate\Support\Facades\DB::connection($conn);
 
-        // 1) Enrich by source_product_id
-        $ids = $job->edits
-            ->filter(fn ($e) => ! empty($e->source_product_id) && ($e->category_name === null || $e->subcategory_name === null))
-            ->pluck('source_product_id')
-            ->unique()
-            ->values()
-            ->all();
-        if (! empty($ids)) {
-            try {
-                $rows = $db->table('sma_products as p')
-                    ->leftJoin('sma_categories as cat', 'p.category_id', '=', 'cat.id')
-                    ->leftJoin('sma_categories as sub', 'p.subcategory_id', '=', 'sub.id')
-                    ->whereIn('p.id', $ids)
-                    ->select(['p.id', 'p.category_id as source_category_id', 'cat.name as category_name', 'sub.name as subcategory_name'])
-                    ->get()
-                    ->keyBy('id');
                 foreach ($job->edits as $edit) {
-                    if (empty($edit->source_product_id)) {
+            if (filled($edit->category_name)) {
                         continue;
                     }
-                    $row = $rows->get($edit->source_product_id);
-                    if ($row) {
-                        if ($edit->category_name === null && $row->category_name !== null) {
-                            $edit->category_name = $row->category_name;
-                        }
-                        if ($edit->subcategory_name === null && $row->subcategory_name !== null) {
-                            $edit->subcategory_name = $row->subcategory_name;
-                        }
-                        if ($edit->source_category_id === null && ! empty($row->source_category_id)) {
-                            $edit->source_category_id = (int) $row->source_category_id;
-                        }
-                    }
-                }
-            } catch (\Throwable $e) {
-                // ignore
-            }
-        }
 
-        // 2) Fallback: enrich by product name for edits still missing category
-        $names = $job->edits
-            ->filter(fn ($e) => ($e->category_name === null || $e->subcategory_name === null) && trim((string) $e->name) !== '')
-            ->map(fn ($e) => trim($e->name))
-            ->unique()
-            ->values()
-            ->all();
-        if (empty($names)) {
-            return;
-        }
-        try {
-            $byName = $db->table('sma_products as p')
-                ->leftJoin('sma_categories as cat', 'p.category_id', '=', 'cat.id')
-                ->leftJoin('sma_categories as sub', 'p.subcategory_id', '=', 'sub.id')
-                ->where(function ($q) use ($names) {
-                    foreach ($names as $n) {
-                        $q->orWhereRaw('TRIM(p.name) = ?', [$n]);
-                    }
-                })
-                ->select(['p.name', 'p.id', 'p.category_id as source_category_id', 'cat.name as category_name', 'sub.name as subcategory_name'])
-                ->get()
-                ->keyBy(fn ($r) => trim((string) $r->name));
-            foreach ($job->edits as $edit) {
-                $key = trim((string) $edit->name);
-                if ($key === '') {
+            try {
+                $rawProductId = isset($edit->source_product_id) ? (int) $edit->source_product_id : null;
+                if (! SaleItemsJobEditsBuilder::isLinkableSourceProductId($rawProductId)) {
+                    $rawProductId = null;
+                }
+
+                $meta = SaleItemsJobEditsBuilder::resolveCategoryMetadata(
+                    $conn,
+                    (string) $edit->name,
+                    $rawProductId
+                );
+
+                if ($meta['category_name'] === null) {
                     continue;
                 }
-                $row = $byName->get($key);
-                if ($row) {
-                    if ($edit->category_name === null && $row->category_name !== null) {
-                        $edit->category_name = $row->category_name;
-                    }
-                    if ($edit->subcategory_name === null && $row->subcategory_name !== null) {
-                        $edit->subcategory_name = $row->subcategory_name;
-                    }
-                    if ($edit->source_category_id === null && ! empty($row->source_category_id)) {
-                        $edit->source_category_id = (int) $row->source_category_id;
-                    }
+
+                if (! filled($edit->category_name)) {
+                    $edit->category_name = $meta['category_name'];
                 }
+                if (! filled($edit->subcategory_name) && $meta['subcategory_name'] !== null) {
+                    $edit->subcategory_name = $meta['subcategory_name'];
+                }
+                if ($edit->source_category_id === null && $meta['source_category_id'] !== null) {
+                    $edit->source_category_id = $meta['source_category_id'];
+                }
+                if ($edit->source_product_id === null && $meta['source_product_id'] !== null) {
+                    $edit->source_product_id = $meta['source_product_id'];
+                }
+            } catch (\Throwable) {
+                // Keep job page usable if POS enrichment fails for one line
             }
-        } catch (\Throwable $e) {
-            // ignore
         }
     }
 
     /** Persist category fields looked up from POS so the job page and filters stay in sync across requests. */
     private function persistEnrichedEditCategories(Job $job): void
     {
-        foreach ($job->edits as $edit) {
-            if ($edit->isDirty(['category_name', 'subcategory_name', 'source_category_id'])) {
+            foreach ($job->edits as $edit) {
+            if ($edit->isDirty(['category_name', 'subcategory_name', 'source_category_id', 'source_product_id'])) {
                 try {
                     $edit->save();
                 } catch (\Throwable) {
@@ -647,19 +938,38 @@ class JobController extends Controller
 
     public function take(Job $job): RedirectResponse
     {
-        if (! auth()->user()->canTakeJob()) {
+        $user = auth()->user();
+        if (! $user->canTakeJob()) {
             abort(403);
         }
-        if ($job->status !== Job::STATUS_NEW) {
+        if ($user->isEditor() && $job->status !== Job::STATUS_NEW) {
             return redirect()->route('jobs.show', $job)->with('error', 'Job is already assigned.');
         }
-        $job->editors()->syncWithoutDetaching([auth()->id()]);
-        if (! $job->assigned_editor_id) {
-            $job->update(['assigned_editor_id' => auth()->id()]);
+        if ($user->usesPoolTakeJobWorkflow() && $user->isAssignedToStudioJob($job)) {
+            return redirect()->route('jobs.show', $job)->with('info', 'You are already on this job.');
         }
+        $job->editors()->syncWithoutDetaching([$user->id]);
+        if (! $job->assigned_editor_id) {
+            $job->update(['assigned_editor_id' => $user->id]);
+        }
+        if ($job->status === Job::STATUS_NEW) {
         $job->update(['status' => Job::STATUS_ASSIGNED]);
-        ActivityLog::log('job_taken', 'Took job ' . $job->ref_number, 'job', $job->id);
-        return redirect()->route('jobs.show', $job)->with('success', 'Job assigned to you.');
+        }
+        $logAction = $user->usesPoolTakeJobWorkflow() ? 'job_taken_pool_worker' : 'job_taken';
+        $logLabel = match ($user->role) {
+            User::ROLE_FRAMING => 'Framing took/joined job ' . $job->ref_number,
+            User::ROLE_PRINTER_FRAMING => 'Printer+Framing took/joined job ' . $job->ref_number,
+            default => 'Took job ' . $job->ref_number,
+        };
+        ActivityLog::log($logAction, $logLabel, 'job', $job->id);
+
+        $success = match ($user->role) {
+            User::ROLE_FRAMING => 'Job is now assigned to you. You can mark framing items done.',
+            User::ROLE_PRINTER_FRAMING => 'Job is now assigned to you. You can update print and framing status.',
+            default => 'Job assigned to you.',
+        };
+
+        return redirect()->route('jobs.show', $job)->with('success', $success);
     }
 
     public function updateStatus(Request $request, Job $job): RedirectResponse
@@ -674,7 +984,7 @@ class JobController extends Controller
             if (! $this->jobEditsFullyComplete($job)) {
                 return redirect()->back()->with(
                     'error',
-                    'Complete every line item first: FRAME category lines need Framing done only; all other lines need Edit done and print (Printed or Not required).'
+                    'Complete every line item first: framing-only categories need Framing done; edit/print categories need Edit done and print (Printed or Not required).'
                 );
             }
         }
@@ -815,11 +1125,11 @@ class JobController extends Controller
     }
 
     /**
-     * Admin only: revert customer confirm so the item can be re-confirmed (editors cannot reverse).
+     * Admin/Manager only: revert customer confirm so the item can be re-confirmed.
      */
     public function unconfirmCustomer(Job $job, JobEdit $edit): RedirectResponse
     {
-        if (! auth()->user()->isAdmin()) {
+        if (! auth()->user()->canManageWorkflowReversals()) {
             abort(403);
         }
         if ($edit->studio_job_id != $job->id) {
@@ -887,12 +1197,17 @@ class JobController extends Controller
         if ($edit->studio_job_id != $job->id) {
             abort(404);
         }
-        if (! auth()->user()->canMarkFramingDone($edit)) {
-            if (auth()->user()->isFraming()
-                && $edit->framing_done_at === null
-                && ! $edit->isFrameCategoryLine()
-                && $edit->print_status !== JobEdit::PRINT_STATUS_PRINTED) {
-                return redirect()->back()->with('error', 'Framing can only be marked after the item is Printed.');
+        $user = auth()->user();
+        if (! $user->canMarkFramingDone($edit)) {
+            if (! $edit->needsDoneWorkflow()) {
+                return redirect()->back()->with('error', 'This category does not use the Done step on this line.');
+            }
+            if ($user->framingMustTakeJobBeforeWorkOn($job)) {
+                $message = $user->role === User::ROLE_PRINTER_FRAMING
+                    ? 'Take this job first before updating print or framing status.'
+                    : 'Take this job first before marking framing items done.';
+
+                return redirect()->back()->with('error', $message);
             }
             abort(403);
         }
@@ -907,7 +1222,7 @@ class JobController extends Controller
         );
         $this->maybeAutoCompleteJob($job->fresh());
 
-        return redirect()->back()->with('success', 'Framing marked done for this item.');
+        return redirect()->back()->with('success', 'Marked done for this item.');
     }
 
     public function unmarkFramingDone(Job $job, JobEdit $edit): RedirectResponse
@@ -929,7 +1244,7 @@ class JobController extends Controller
         );
         $this->maybeReopenJobIfIncomplete($job->fresh());
 
-        return redirect()->back()->with('success', 'Framing done cleared for this item.');
+        return redirect()->back()->with('success', 'Done cleared for this item.');
     }
 
     public function stepBackEditorStatus(Job $job, JobEdit $edit): RedirectResponse
@@ -948,6 +1263,9 @@ class JobController extends Controller
         if ($edit->studio_job_id != $job->id) {
             abort(404);
         }
+        if ($edit->hasEditDone()) {
+            return redirect()->back()->with('error', 'This item is already Edit Done. Only Admin or Manager can clear it.');
+        }
         if ($response = $this->ensureEstimatedMinutesSet($edit)) {
             return $response;
         }
@@ -961,6 +1279,32 @@ class JobController extends Controller
         $this->maybeAutoCompleteJob($job->fresh());
         ActivityLog::log('job_edit_done', 'Edit Done: "' . $edit->name . '" on job ' . $job->ref_number . ' at ' . now()->format('Y-m-d H:i'), 'job', $job->id);
         return redirect()->back()->with('success', 'Edit marked as done.');
+    }
+
+    public function clearEditDone(Job $job, JobEdit $edit): RedirectResponse
+    {
+        if (! auth()->user()->canRevertEditDoneOnJobEdit($edit)) {
+            abort(403);
+        }
+        if ($edit->studio_job_id != $job->id) {
+            abort(404);
+        }
+        if (! $this->updateJobEditStrict($edit, [
+            'edit_done_at' => null,
+            'edit_status' => JobEdit::EDIT_STATUS_IN_PROGRESS,
+            'completed_at' => null,
+        ])) {
+            return $this->redirectJobEditMigration();
+        }
+        $this->maybeReopenJobIfIncomplete($job->fresh());
+        ActivityLog::log(
+            'job_edit_done_cleared',
+            'Edit Done cleared: "' . $edit->name . '" on job ' . $job->ref_number . ' (Admin/Manager)',
+            'job',
+            $job->id
+        );
+
+        return redirect()->back()->with('success', 'Edit Done cleared for this item.');
     }
 
     public function updateEditStatus(Request $request, Job $job, JobEdit $edit): RedirectResponse
@@ -979,18 +1323,22 @@ class JobController extends Controller
             'edit_status' => 'required|in:pending,in_progress,completed',
         ]);
 
-        // If this item is already completed, only Admin is allowed to revert it back to another status.
-        if ($edit->edit_status === JobEdit::EDIT_STATUS_COMPLETED
+        if ($edit->hasEditDone()
             && $valid['edit_status'] !== JobEdit::EDIT_STATUS_COMPLETED
-            && ! $user->isAdmin()
+            && ! $user->canManageWorkflowReversals()
         ) {
-            return redirect()->back()->with('error', 'Only Admin can revert a completed item.');
+            return redirect()->back()->with('error', 'Only Admin or Manager can revert Edit Done.');
         }
 
-        if (! $this->updateJobEditStrict($edit, [
+        $payload = [
             'edit_status' => $valid['edit_status'],
             'completed_at' => $valid['edit_status'] === JobEdit::EDIT_STATUS_COMPLETED ? now() : null,
-        ])) {
+        ];
+        if ($valid['edit_status'] !== JobEdit::EDIT_STATUS_COMPLETED && $user->canManageWorkflowReversals()) {
+            $payload['edit_done_at'] = null;
+        }
+
+        if (! $this->updateJobEditStrict($edit, $payload)) {
             return $this->redirectJobEditMigration();
         }
         if ($job->fresh()->allEditsCompleted()) {
@@ -1002,28 +1350,49 @@ class JobController extends Controller
 
     public function updatePrintStatus(Request $request, Job $job, JobEdit $edit): RedirectResponse
     {
-        if ($response = $this->rejectIfFrameOnlyEditorFlow($edit)) {
-            return $response;
-        }
-        if (! auth()->user()->canUpdatePrintStatus()) {
+        $user = auth()->user();
+        if (! $user->canUpdatePrintStatus()) {
             abort(403);
         }
         if ($edit->studio_job_id != $job->id) {
             abort(404);
         }
-        if (! auth()->user()->canApplyPrintStatusToJobEdit($edit)) {
+        if ($user->framingMustTakeJobBeforeWorkOn($job)) {
+            return redirect()->back()->with('error', 'Take this job first before updating print or framing status.');
+        }
+        if (! $user->canApplyPrintStatusToJobEdit($edit)) {
             abort(403);
         }
         $valid = $request->validate([
             'print_status' => 'required|in:not_required,pending,sent_to_print,printed',
         ]);
+        if (! auth()->user()->canSetPrintStatusOnJobEdit($edit, $valid['print_status'])) {
+            $message = match (true) {
+                $edit->print_status === JobEdit::PRINT_STATUS_PRINTED
+                    && $valid['print_status'] !== JobEdit::PRINT_STATUS_PRINTED
+                    => 'Printed cannot be changed except by Admin or Manager.',
+                $valid['print_status'] === JobEdit::PRINT_STATUS_NOT_REQUIRED
+                    && ! JobEdit::allowsNotRequiredFrom($edit->print_status)
+                    => 'Not required cannot be set after Sent to print or Printed. Contact Admin or Manager.',
+                JobEdit::isTerminalPrintStatus($edit->print_status)
+                    && ! JobEdit::isTerminalPrintStatus($valid['print_status'])
+                    => 'Only Admin or Manager can reverse Print Done.',
+                default => 'You cannot update print status on this line.',
+            };
+
+            return redirect()->back()->with('error', $message);
+        }
         if (! $this->updateJobEditStrict($edit, [
             'print_status' => $valid['print_status'],
             'print_status_at' => now(),
         ])) {
             return $this->redirectJobEditMigration();
         }
+        if (JobEdit::isTerminalPrintStatus($valid['print_status'])) {
         $this->maybeAutoCompleteJob($job->fresh());
+        } else {
+            $this->maybeReopenJobIfIncomplete($job->fresh());
+        }
         $label = match ($valid['print_status']) {
             'not_required' => 'Not required',
             'pending' => 'Pending',
@@ -1062,7 +1431,7 @@ class JobController extends Controller
                 abort(403);
             }
         } elseif ($validated['action'] === 'framing_done') {
-            if (! $user->isFraming() && ! $user->isAdmin()) {
+            if (! $user->isFraming() && ! $user->isAdmin() && ! $user->isManager()) {
                 abort(403);
             }
         } elseif ($validated['action'] === 'framing_clear') {
@@ -1115,7 +1484,7 @@ class JobController extends Controller
                     }
 
                     if ($validated['action'] === 'print_status') {
-                        $reason = $this->bulkPrintStatusSkipReason($edit, $user);
+                        $reason = $this->bulkPrintStatusSkipReason($edit, $user, $validated['print_status']);
                         if ($reason !== null) {
                             $ineligibleSelected++;
 
@@ -1335,7 +1704,7 @@ class JobController extends Controller
                 'printed' => 'Printed',
                 default => (string) $validated['print_status'],
             },
-            'framing_done' => 'Framing done',
+            'framing_done' => 'Done',
             'framing_clear' => 'Framing cleared',
             'set_estimated_minutes' => 'Est. time → ' . (string) $bulkMinutes . ' min',
             'claim_start' => 'Claim & start → ' . (string) $bulkMinutes . ' min',
@@ -1392,22 +1761,35 @@ class JobController extends Controller
         $globalBlockedProductIds = BlockedProduct::blockedProductIds();
         $allowedCategoryIds = $user ? $user->scopedCategoryIdsForJobLineTable() : [];
 
-        return $job->edits->filter(function (JobEdit $e) use ($globalBlockedCategoryIds, $globalBlockedProductIds, $allowedCategoryIds) {
-            $catId = $e->source_category_id ? (int) $e->source_category_id : null;
-            $productId = $e->source_product_id ? (int) $e->source_product_id : null;
+        return $job->edits->filter(function (JobEdit $e) use ($user) {
+            if (! $user) {
+                return ! $e->isGloballyHiddenFromStudioWorkflow();
+            }
 
-            $categoryBlocked = $catId !== null && in_array($catId, $globalBlockedCategoryIds, true);
-            $productBlocked = $productId !== null && in_array($productId, $globalBlockedProductIds, true);
-
-            $categoryAllowedForEditor = $allowedCategoryIds === [] || $catId === null || in_array($catId, $allowedCategoryIds, true);
-
-            return ! $categoryBlocked && ! $productBlocked && $categoryAllowedForEditor;
+            return $user->isJobLineVisibleToMe($e);
         });
     }
 
-    private function bulkPrintStatusSkipReason(JobEdit $edit, User $user): ?string
+    private function bulkPrintStatusSkipReason(JobEdit $edit, User $user, ?string $newStatus = null): ?string
     {
-        if (! $user->canApplyPrintStatusToJobEdit($edit)) {
+        if ($newStatus === null) {
+            return ! $user->canApplyPrintStatusToJobEdit($edit) ? 'not eligible' : null;
+        }
+
+        if (! $user->canSetPrintStatusOnJobEdit($edit, $newStatus)) {
+            if ($edit->print_status === JobEdit::PRINT_STATUS_PRINTED
+                && $newStatus !== JobEdit::PRINT_STATUS_PRINTED) {
+                return 'Printed — Admin/Manager only to change';
+            }
+            if ($newStatus === JobEdit::PRINT_STATUS_NOT_REQUIRED
+                && ! JobEdit::allowsNotRequiredFrom($edit->print_status)) {
+                return 'Not required not allowed after print started';
+            }
+            if (JobEdit::isTerminalPrintStatus($edit->print_status)
+                && ! JobEdit::isTerminalPrintStatus($newStatus)) {
+                return 'Only Admin/Manager can reverse Print Done';
+            }
+
             return 'not eligible';
         }
 
@@ -1437,8 +1819,8 @@ class JobController extends Controller
 
     private function bulkTimeCommonSkipReason(JobEdit $edit, User $user): ?string
     {
-        if ($edit->isFrameCategoryLine()) {
-            return 'FRAME line — no editor time';
+        if (! $edit->needsEditWorkflow()) {
+            return 'This line does not use the editor workflow';
         }
         if (! $user->canEditJobItem($edit)) {
             return 'No permission for this line';
@@ -1486,8 +1868,8 @@ class JobController extends Controller
      */
     private function bulkEditorActionCommonSkipReason(JobEdit $edit, User $user): ?string
     {
-        if ($edit->isFrameCategoryLine()) {
-            return 'FRAME line — no editor flow';
+        if (! $edit->needsEditWorkflow()) {
+            return 'This line does not use the editor workflow';
         }
         if (! $user->canEditJobItem($edit)) {
             return 'No permission for this line';
@@ -1639,16 +2021,29 @@ class JobController extends Controller
         );
     }
 
-    private function rejectIfFrameOnlyEditorFlow(JobEdit $edit): ?RedirectResponse
+    /** Block photo-editor steps (claim, edit done, etc.) on done-only and print-only lines. */
+    private function rejectIfNonEditorWorkflow(JobEdit $edit): ?RedirectResponse
     {
-        if ($edit->isFrameCategoryLine()) {
+        if ($edit->isDoneOnlyWorkflow()) {
             return redirect()->back()->with(
                 'error',
-                'FRAME category items only use Framing done — no editor or print steps on those lines.'
+                'This category uses Done only — no editor steps on this line.'
+            );
+        }
+        if ($edit->isPrintOnlyWorkflow()) {
+            return redirect()->back()->with(
+                'error',
+                'This category uses print only — use the printer status buttons on this line.'
             );
         }
 
         return null;
+    }
+
+    /** @deprecated Use rejectIfNonEditorWorkflow() */
+    private function rejectIfFrameOnlyEditorFlow(JobEdit $edit): ?RedirectResponse
+    {
+        return $this->rejectIfNonEditorWorkflow($edit);
     }
 
     /**
@@ -1676,6 +2071,113 @@ class JobController extends Controller
         }
 
         $job->setAttribute('due_date', $resolved);
+    }
+
+    /**
+     * Line-level POS vs job diff for a small page of jobs (Jobs → POS updated).
+     *
+     * @param  \Illuminate\Support\Collection<int, Job>  $jobs
+     * @return array<int, array<string, mixed>>
+     */
+    private function posUpdatedMetaForJobs(\Illuminate\Support\Collection $jobs): array
+    {
+        if ($jobs->isEmpty()) {
+            return [];
+        }
+
+        $conn = 'source';
+        if (empty(config("database.connections.{$conn}.database"))) {
+            return [];
+        }
+
+        $saleIds = $jobs->pluck('source_id')->map(fn ($id) => (int) $id)->filter(fn ($id) => $id > 0)->unique()->values()->all();
+        if ($saleIds === []) {
+            return [];
+        }
+
+        try {
+            $grouped = DB::connection($conn)
+                ->table('sma_sale_items')
+                ->whereIn('sale_id', $saleIds)
+                ->orderBy('id')
+                ->get(['id', 'sale_id', 'product_id', 'product_name', 'quantity'])
+                ->groupBy('sale_id');
+        } catch (\Throwable) {
+            return [];
+        }
+
+        $out = [];
+        foreach ($jobs as $job) {
+            $items = $grouped->get((int) $job->source_id, collect());
+            $cmp = PosJobLineDrift::compare($job, PosJobLineDrift::lightweightRowsFromPosSaleItems($items->all()));
+            $out[$job->id] = [
+                'job_line_count' => $cmp['job_line_count'],
+                'pos_line_count' => $cmp['pos_line_count'],
+                'summary' => $cmp['summary'],
+                'pending_count' => $cmp['pending_count'],
+                'changed' => $cmp['changed'],
+                'added' => $cmp['added'],
+                'removed' => $cmp['removed'],
+                'job_lines' => $cmp['job_lines'],
+                'pos_lines' => $cmp['pos_lines'],
+            ];
+        }
+
+        return $out;
+    }
+
+    /**
+     * @param  \Illuminate\Support\Collection<int, mixed>  $sourceIds
+     * @return array{due: array<string, string>, staff_note: array<string, string>, timestamps: array<string, array{created: ?string, updated: ?string}>}
+     */
+    private function fetchPosSaleListMetaBySourceIds(\Illuminate\Support\Collection $sourceIds): array
+    {
+        $empty = ['due' => [], 'staff_note' => [], 'timestamps' => []];
+        $conn = 'source';
+        if (empty(config("database.connections.{$conn}.database"))) {
+            return $empty;
+        }
+
+        $ids = $sourceIds->map(fn ($id) => (int) $id)->filter(fn ($id) => $id > 0)->unique()->values()->all();
+        if ($ids === []) {
+            return $empty;
+        }
+
+        try {
+            $rows = DB::connection($conn)->table('sma_sales')->whereIn('id', $ids)->get([
+                'id',
+                'due_date',
+                'staff_note',
+                'date',
+                'updated_at',
+            ]);
+        } catch (\Throwable) {
+            return $empty;
+        }
+
+        $due = [];
+        $staff = [];
+        $timestamps = [];
+        foreach ($rows as $r) {
+            $key = (string) (int) $r->id;
+            $dueRaw = $r->due_date ?? null;
+            if ($dueRaw !== null && $dueRaw !== '') {
+                $s = (string) $dueRaw;
+                if ($s !== '0000-00-00' && $s !== '0000-00-00 00:00:00') {
+                    $due[$key] = $s;
+                }
+            }
+            $note = Job::normalizePosStaffNote($r->staff_note ?? null);
+            if ($note !== null) {
+                $staff[$key] = $note;
+            }
+            $timestamps[$key] = [
+                'created' => $this->normalizePosTimestampRaw($r->date ?? null),
+                'updated' => $this->normalizePosTimestampRaw($r->updated_at ?? null),
+            ];
+        }
+
+        return ['due' => $due, 'staff_note' => $staff, 'timestamps' => $timestamps];
     }
 
     private function fetchPosSaleDueDateRawForJob(Job $job): ?string
@@ -1742,6 +2244,252 @@ class JobController extends Controller
         return $out;
     }
 
+    /**
+     * @return array{created: ?string, updated: ?string}
+     */
+    private function fetchPosSaleTimestampsForJob(Job $job): array
+    {
+        $empty = ['created' => null, 'updated' => null];
+        if (empty($job->source_id)) {
+            return $empty;
+        }
+        $map = $this->fetchPosSaleTimestampsBySourceIds(collect([(string) $job->source_id]));
+
+        return $map[(string) (int) $job->source_id] ?? $empty;
+    }
+
+    /**
+     * @param  \Illuminate\Support\Collection<int, mixed>  $sourceIds
+     * @return array<string, array{created: ?string, updated: ?string}>
+     */
+    private function fetchPosSaleTimestampsBySourceIds(\Illuminate\Support\Collection $sourceIds): array
+    {
+        $conn = 'source';
+        if (empty(config("database.connections.{$conn}.database"))) {
+            return [];
+        }
+
+        $ids = $sourceIds->map(fn ($id) => (int) $id)->filter(fn ($id) => $id > 0)->unique()->values()->all();
+        if ($ids === []) {
+            return [];
+        }
+
+        try {
+            $rows = DB::connection($conn)->table('sma_sales')->whereIn('id', $ids)->get(['id', 'date', 'updated_at']);
+        } catch (\Throwable) {
+            return [];
+        }
+
+        $out = [];
+        foreach ($rows as $r) {
+            $out[(string) (int) $r->id] = [
+                'created' => $this->normalizePosTimestampRaw($r->date ?? null),
+                'updated' => $this->normalizePosTimestampRaw($r->updated_at ?? null),
+            ];
+        }
+
+        return $out;
+    }
+
+    private function normalizePosTimestampRaw(mixed $raw): ?string
+    {
+        if ($raw === null || $raw === '') {
+            return null;
+        }
+        $s = trim((string) $raw);
+        if ($s === '' || $s === '0000-00-00' || $s === '0000-00-00 00:00:00') {
+            return null;
+        }
+
+        return $s;
+    }
+
+    private function fetchPosSaleStaffNoteForJob(Job $job): ?string
+    {
+        if (empty($job->source_id)) {
+            return null;
+        }
+
+        $conn = 'source';
+        if (empty(config("database.connections.{$conn}.database"))) {
+            return null;
+        }
+
+        try {
+            $v = DB::connection($conn)->table('sma_sales')->where('id', (int) $job->source_id)->value('staff_note');
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return Job::normalizePosStaffNote($v);
+    }
+
+    /**
+     * @param  \Illuminate\Support\Collection<int, mixed>  $sourceIds
+     * @return array<string, string>
+     */
+    private function fetchPosSaleStaffNoteBySourceIds(\Illuminate\Support\Collection $sourceIds): array
+    {
+        $conn = 'source';
+        if (empty(config("database.connections.{$conn}.database"))) {
+            return [];
+        }
+
+        $ids = $sourceIds->map(fn ($id) => (int) $id)->filter(fn ($id) => $id > 0)->unique()->values()->all();
+        if ($ids === []) {
+            return [];
+        }
+
+        try {
+            $rows = DB::connection($conn)->table('sma_sales')->whereIn('id', $ids)->get(['id', 'staff_note']);
+        } catch (\Throwable) {
+            return [];
+        }
+
+        $out = [];
+        foreach ($rows as $r) {
+            $note = Job::normalizePosStaffNote($r->staff_note ?? null);
+            if ($note !== null) {
+                $out[(string) (int) $r->id] = $note;
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Every line name on each Job Pool sale (opened job → all job_edits; otherwise all POS lines).
+     *
+     * @param  \Illuminate\Support\Collection<int, object>|\Illuminate\Contracts\Pagination\LengthAwarePaginator  $sales
+     * @param  \Illuminate\Support\Collection<string, Job>  $jobsBySourceId
+     * @return array<int, list<string>>
+     */
+    private function buildAllItemNamesBySaleIdForJobPool(string $conn, $sales, \Illuminate\Support\Collection $jobsBySourceId): array
+    {
+        $out = [];
+        $saleIdsNeedingPos = [];
+
+        foreach ($sales as $sale) {
+            $saleId = (int) $sale->id;
+            $job = $jobsBySourceId->get((string) $saleId);
+            if ($job && $job->edits->isNotEmpty()) {
+                $out[$saleId] = $job->edits
+                    ->sortBy('sort_order')
+                    ->map(fn (JobEdit $edit) => trim((string) ($edit->name ?? '')) ?: '—')
+                    ->values()
+                    ->all();
+
+                continue;
+            }
+
+            $saleIdsNeedingPos[] = $saleId;
+        }
+
+        if ($saleIdsNeedingPos === []) {
+            return $out;
+        }
+
+        try {
+            $grouped = DB::connection($conn)
+                ->table('sma_sale_items')
+                ->whereIn('sale_id', $saleIdsNeedingPos)
+                ->orderBy('id')
+                ->get()
+                ->groupBy('sale_id');
+        } catch (\Throwable) {
+            return $out;
+        }
+
+        foreach ($saleIdsNeedingPos as $saleId) {
+            $items = $grouped->get($saleId, collect());
+            if ($items->isEmpty()) {
+                continue;
+            }
+            $rows = SaleItemsJobEditsBuilder::rowsFromSaleItems($conn, $items->all());
+            $names = array_map(fn (array $row) => trim((string) ($row['name'] ?? '')) ?: '—', $rows);
+            if ($names !== []) {
+                $out[$saleId] = $names;
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Paginate Jobs list by soonest due. Falls back to local due_date if POS cross-db ORDER BY fails on the server.
+     */
+    private function paginateJobsBySoonestDue(Builder $query): LengthAwarePaginator
+    {
+        try {
+            return Job::orderJobPoolByPosDueDate((clone $query))->paginate(15)->withQueryString();
+        } catch (\Throwable $e) {
+            Log::warning('Jobs list POS due-date sort failed; using studio_jobs.due_date', [
+                'message' => $e->getMessage(),
+            ]);
+
+            $table = (new Job)->getTable();
+
+            return (clone $query)
+                ->reorder()
+                ->orderBy($table.'.due_date')
+                ->orderBy($table.'.created_at')
+                ->orderBy($table.'.id')
+                ->paginate(15)
+                ->withQueryString();
+        }
+    }
+
+    private function resolvedCategoryFilterKey(Request $request): ?string
+    {
+        $key = trim((string) $request->input('category', ''));
+        if ($key === '' || ! CategoryAppearance::isValidCanonicalKey($key)) {
+            return null;
+        }
+
+        return $key;
+    }
+
+    private function applyCanonicalCategoryFilterToJobsQuery(Builder $query, string $canonicalKey): void
+    {
+        $names = CategoryAppearance::normalizedNamesForCanonicalKey($canonicalKey);
+        if ($names === []) {
+            $query->whereRaw('1 = 0');
+
+            return;
+        }
+
+        $query->whereHas('edits', function ($q) use ($names) {
+            $q->where(function ($inner) use ($names) {
+                foreach ($names as $name) {
+                    $inner->orWhereRaw('UPPER(TRIM(category_name)) = ?', [$name]);
+                }
+            });
+        });
+    }
+
+    /**
+     * Restrict a sma_sales query to sales that include at least one product in the given POS category.
+     */
+    private function applyCanonicalCategoryFilterToPosSalesQuery($query, string $canonicalKey, string $conn): void
+    {
+        $names = CategoryAppearance::normalizedNamesForCanonicalKey($canonicalKey);
+        if ($names === []) {
+            $query->whereRaw('1 = 0');
+
+            return;
+        }
+
+        $placeholders = implode(',', array_fill(0, count($names), '?'));
+        $query->whereExists(function ($q) use ($names, $placeholders) {
+            $q->select(DB::raw(1))
+                ->from('sma_sale_items as si_cat')
+                ->join('sma_products as p_cat', 'si_cat.product_id', '=', 'p_cat.id')
+                ->join('sma_categories as c_cat', 'p_cat.category_id', '=', 'c_cat.id')
+                ->whereColumn('si_cat.sale_id', 'sma_sales.id')
+                ->whereRaw('UPPER(TRIM(c_cat.name)) IN ('.$placeholders.')', $names);
+        });
+    }
+
     private function jobEditsFullyComplete(Job $job): bool
     {
         return $job->allEditsCompleted();
@@ -1773,6 +2521,12 @@ class JobController extends Controller
      */
     private function scopeDedicatedPoolJobsForWorkflowTabs(Builder $query, User $user, array $poolJobIds): Builder
     {
+        if (! $user->jobPoolShowsFramingQueue()) {
+            return $poolJobIds === []
+                ? $query->whereRaw('0 = 1')
+                : $query->whereIn('id', $poolJobIds);
+        }
+
         return $query->where(function (Builder $outer) use ($user, $poolJobIds) {
             if ($poolJobIds !== []) {
                 $outer->whereIn('id', $poolJobIds);
@@ -1784,11 +2538,13 @@ class JobController extends Controller
                     Job::STATUS_COMPLETED,
                 ])
                     ->whereHas('edits', function ($ed) use ($user) {
-                        $ed->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) = ?', ['FRAME']);
+                        CategoryWorkflow::scopeDoneOnlyCategory($ed);
                         $allowed = $user->assignedCategoryIds();
                         if ($allowed !== []) {
-                            $ed->whereNotNull('source_category_id')
-                                ->whereIn('source_category_id', $allowed);
+                            $ed->where(function ($cat) use ($allowed) {
+                                $cat->whereNull('source_category_id')
+                                    ->orWhereIn('source_category_id', $allowed);
+                            });
                         }
                     });
             });
@@ -1800,20 +2556,45 @@ class JobController extends Controller
      *
      * @param  list<string>  $printedTerminal
      */
-    private function scopeJobsWhereAnyEditIncomplete(Builder $query, array $printedTerminal): void
+    private function scopeJobsWhereAnyEditIncomplete(Builder $query, array $printedTerminal, ?User $user = null): void
     {
-        $query->where(function ($outer) use ($printedTerminal) {
+        $query->where(function ($outer) use ($printedTerminal, $user) {
             $outer->whereDoesntHave('edits')
-                ->orWhereHas('edits', function ($eq) use ($printedTerminal) {
+                ->orWhereHas('edits', function ($eq) use ($printedTerminal, $user) {
+                    if ($user && $user->isPrinter()) {
+                        $eq->where(function ($inner) use ($printedTerminal) {
+                            CategoryWorkflow::scopePrintOnlyCategory($inner);
+                            $inner->whereNotIn('print_status', $printedTerminal);
+                        })->orWhere(function ($inner) use ($printedTerminal) {
+                            CategoryWorkflow::scopeEditPrintCategory($inner);
+                            $inner->whereNotNull('edit_done_at')
+                                ->whereNotIn('print_status', $printedTerminal);
+                        });
+
+                        return;
+                    }
+
+                    if ($user && $user->role === User::ROLE_FRAMING) {
+                        $eq->where(function ($inner) {
+                            CategoryWorkflow::scopeDoneOnlyCategory($inner);
+                            $inner->whereNull('framing_done_at');
+                        });
+
+                        return;
+                    }
+
                     $eq->where(function ($inner) {
-                        $inner->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) = ?', ['FRAME'])
-                            ->whereNull('framing_done_at');
+                        CategoryWorkflow::scopeDoneOnlyCategory($inner);
+                        $inner->whereNull('framing_done_at');
                     })->orWhere(function ($inner) use ($printedTerminal) {
-                        $inner->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) <> ?', ['FRAME'])
-                            ->where(function ($x) use ($printedTerminal) {
-                                $x->whereNull('edit_done_at')
-                                    ->orWhereNotIn('print_status', $printedTerminal);
-                            });
+                        CategoryWorkflow::scopePrintOnlyCategory($inner);
+                        $inner->whereNotIn('print_status', $printedTerminal);
+                    })->orWhere(function ($inner) use ($printedTerminal) {
+                        CategoryWorkflow::scopeEditPrintCategory($inner);
+                        $inner->where(function ($x) use ($printedTerminal) {
+                            $x->whereNull('edit_done_at')
+                                ->orWhereNotIn('print_status', $printedTerminal);
+                        });
                     });
                 });
         });
@@ -1835,23 +2616,23 @@ class JobController extends Controller
                 $outer->where(function (Builder $allEditedPrintPending) use ($printedTerminal) {
                     $allEditedPrintPending
                         ->whereDoesntHave('edits', function ($q) {
-                            $q->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) <> ?', ['FRAME'])
-                                ->whereNull('edit_done_at');
+                            CategoryWorkflow::scopeEditPrintCategory($q);
+                            $q->whereNull('edit_done_at');
                         })
                         ->whereHas('edits', function ($q) use ($printedTerminal) {
-                            $q->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) <> ?', ['FRAME'])
-                                ->whereNotNull('edit_done_at')
+                            CategoryWorkflow::scopeEditPrintCategory($q);
+                            $q->whereNotNull('edit_done_at')
                                 ->whereNotIn('print_status', $printedTerminal);
                         });
                 })->orWhere(function (Builder $partialPhotoEdit) {
                     $partialPhotoEdit
                         ->whereHas('edits', function ($q) {
-                            $q->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) <> ?', ['FRAME'])
-                                ->whereNotNull('edit_done_at');
+                            CategoryWorkflow::scopeEditPrintCategory($q);
+                            $q->whereNotNull('edit_done_at');
                         })
                         ->whereHas('edits', function ($q) {
-                            $q->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) <> ?', ['FRAME'])
-                                ->whereNull('edit_done_at');
+                            CategoryWorkflow::scopeEditPrintCategory($q);
+                            $q->whereNull('edit_done_at');
                         });
                 });
             });
@@ -1863,14 +2644,21 @@ class JobController extends Controller
     {
         $query->whereIn('status', [Job::STATUS_ASSIGNED, Job::STATUS_IN_PROGRESS])
             ->whereHas('edits', function ($q) {
-                $q->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) <> ?', ['FRAME']);
+                CategoryWorkflow::scopePrintWorkflowCategory($q);
             })
             ->whereDoesntHave('edits', function ($q) use ($printedTerminal) {
-                $q->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) <> ?', ['FRAME'])
-                    ->where(function ($x) use ($printedTerminal) {
-                        $x->whereNull('edit_done_at')
-                            ->orWhereNotIn('print_status', $printedTerminal);
+                $q->where(function ($lines) use ($printedTerminal) {
+                    $lines->where(function ($printOnly) use ($printedTerminal) {
+                        CategoryWorkflow::scopePrintOnlyCategory($printOnly);
+                        $printOnly->whereNotIn('print_status', $printedTerminal);
+                    })->orWhere(function ($editPrint) use ($printedTerminal) {
+                        CategoryWorkflow::scopeEditPrintCategory($editPrint);
+                        $editPrint->where(function ($x) use ($printedTerminal) {
+                            $x->whereNull('edit_done_at')
+                                ->orWhereNotIn('print_status', $printedTerminal);
+                        });
                     });
+                });
             });
         $this->scopeJobsWhereAnyEditIncomplete($query, $printedTerminal);
 
@@ -1890,15 +2678,23 @@ class JobController extends Controller
             Job::STATUS_COMPLETED,
         ])
             ->whereHas('edits', function ($q) {
-                $q->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) = ?', ['FRAME'])
-                    ->whereNotNull('framing_done_at');
+                CategoryWorkflow::scopeDoneOnlyCategory($q);
+                $q->whereNotNull('framing_done_at');
             })
-            ->whereHas('edits', function ($q) use ($printedTerminal) {
-                $q->whereRaw('UPPER(TRIM(IFNULL(category_name, ""))) <> ?', ['FRAME'])
-                    ->where(function ($x) use ($printedTerminal) {
+            ->where(function ($outer) use ($printedTerminal) {
+                $outer->whereHas('edits', function ($q) use ($printedTerminal) {
+                    CategoryWorkflow::scopePrintOnlyCategory($q);
+                    $q->whereNotIn('print_status', $printedTerminal);
+                })->orWhereHas('edits', function ($q) use ($printedTerminal) {
+                    CategoryWorkflow::scopeEditPrintCategory($q);
+                    $q->where(function ($x) use ($printedTerminal) {
                         $x->whereNull('edit_done_at')
                             ->orWhereNotIn('print_status', $printedTerminal);
                     });
+                })->orWhereHas('edits', function ($q) {
+                    CategoryWorkflow::scopeDoneOnlyCategory($q);
+                    $q->whereNull('framing_done_at');
+                });
             });
 
         return $query;

@@ -49,9 +49,6 @@
                                 @include('components.icons', ['name' => 'briefcase', 'class' => 'w-4 h-4'])
                                 Job {{ $relatedJob->ref_number }}
                             </a>
-                            @if($relatedJob->customer_name)
-                                <span class="ml-2 text-slate-600 dark:text-slate-400">({{ $relatedJob->customer_name }})</span>
-                            @endif
                         </dd>
                     </div>
                 @elseif($activity_log->subject_type === 'job' && $activity_log->subject_id)
