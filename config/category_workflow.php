@@ -30,6 +30,8 @@ return [
         'Sublimation Print',
         'SUBLIMATION PRINT',
         'Wall Clocks',
+        'Thanks Card Print',
+        'THANKS CARD PRINT',
     ],
 
     'print_only' => [

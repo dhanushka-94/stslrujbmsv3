@@ -133,21 +133,34 @@ class CategoryWorkflow
     }
 
     /**
+     * Edit+print profile, including unlisted categories (same default as profileForCategoryName()).
+     *
      * @param  EloquentBuilder<\Illuminate\Database\Eloquent\Model>|QueryBuilder  $query
      */
     public static function scopeEditPrintCategory(EloquentBuilder|QueryBuilder $query, string $column = 'category_name'): void
     {
-        self::scopeProfileIn($query, [self::PROFILE_EDIT_PRINT], $column);
+        foreach (self::normalizedNamesForProfile(self::PROFILE_PRINT_ONLY) as $name) {
+            $query->whereRaw(
+                'UPPER(TRIM(IFNULL('.$column.', ""))) <> ?',
+                [$name]
+            );
+        }
+        foreach (self::normalizedNamesForProfile(self::PROFILE_DONE_ONLY) as $name) {
+            $query->whereRaw(
+                'UPPER(TRIM(IFNULL('.$column.', ""))) <> ?',
+                [$name]
+            );
+        }
     }
 
     /**
-     * Lines that use the printer queue (edit then print, or print only).
+     * Lines that use the printer queue (edit then print, or print only) — i.e. not done-only.
      *
      * @param  EloquentBuilder<\Illuminate\Database\Eloquent\Model>|QueryBuilder  $query
      */
     public static function scopePrintWorkflowCategory(EloquentBuilder|QueryBuilder $query, string $column = 'category_name'): void
     {
-        self::scopeProfileIn($query, [self::PROFILE_EDIT_PRINT, self::PROFILE_PRINT_ONLY], $column);
+        self::scopeNotDoneOnlyCategory($query, $column);
     }
 
     /**
@@ -203,8 +216,7 @@ class CategoryWorkflow
     public static function scopeJobPoolCategoriesForUser(EloquentBuilder|QueryBuilder $query, \App\Models\User $user, string $column = 'category_name'): void
     {
         if ($user->jobPoolShowsPrintQueue() && $user->jobPoolShowsFramingQueue()) {
-            self::scopeProfileIn($query, [self::PROFILE_EDIT_PRINT, self::PROFILE_PRINT_ONLY, self::PROFILE_DONE_ONLY], $column);
-
+            // All workflow profiles (including unlisted → edit_print): no category exclusion.
             return;
         }
 
