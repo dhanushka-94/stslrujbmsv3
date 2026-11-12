@@ -189,6 +189,88 @@
             setInterval(update, 1000);
         })();
     </script>
+    {{-- Keep scroll position after job (and other) form POSTs — lives in layout so server deploy of this file is enough. --}}
+    <script>
+        (function () {
+            try { if ('scrollRestoration' in history) history.scrollRestoration = 'manual'; } catch (e) {}
+
+            var storageKey = 'appPreserveScroll';
+
+            function pageKey() {
+                return window.location.pathname + window.location.search;
+            }
+
+            function saveScroll(fromEl) {
+                var payload = {
+                    key: pageKey(),
+                    y: window.scrollY || window.pageYOffset || 0,
+                    editId: null,
+                    at: Date.now()
+                };
+                var node = fromEl;
+                while (node && node !== document.body) {
+                    if (node.id && String(node.id).indexOf('job-edit-') === 0) {
+                        payload.editId = String(node.id).replace('job-edit-', '');
+                        break;
+                    }
+                    node = node.parentElement;
+                }
+                try { sessionStorage.setItem(storageKey, JSON.stringify(payload)); } catch (e) {}
+            }
+
+            function restoreScroll() {
+                var raw = null;
+                try { raw = sessionStorage.getItem(storageKey); } catch (e) {}
+                if (!raw) return;
+                var data = null;
+                try { data = JSON.parse(raw); } catch (e) { return; }
+                if (!data || data.key !== pageKey()) return;
+                // Ignore stale saves older than 2 minutes.
+                if (data.at && (Date.now() - data.at) > 120000) {
+                    try { sessionStorage.removeItem(storageKey); } catch (e) {}
+                    return;
+                }
+
+                var apply = function () {
+                    if (data.editId) {
+                        var row = document.getElementById('job-edit-' + data.editId);
+                        if (row) {
+                            row.scrollIntoView({ block: 'center', inline: 'nearest' });
+                            try { sessionStorage.removeItem(storageKey); } catch (e) {}
+                            return;
+                        }
+                    }
+                    if (typeof data.y === 'number') {
+                        window.scrollTo(0, data.y);
+                        try { sessionStorage.removeItem(storageKey); } catch (e) {}
+                    }
+                };
+
+                apply();
+                setTimeout(apply, 50);
+                setTimeout(apply, 250);
+                setTimeout(apply, 600);
+            }
+
+            document.addEventListener('submit', function (e) {
+                var form = e.target;
+                if (!form || form.tagName !== 'FORM' || e.defaultPrevented) return;
+                var action = form.getAttribute('action') || '';
+                if (action.indexOf('logout') !== -1) return;
+                var method = (form.getAttribute('method') || 'get').toLowerCase();
+                if (method === 'dialog') return;
+                saveScroll(form);
+            }, true);
+
+            window.addEventListener('app-loading-hidden', restoreScroll);
+            window.addEventListener('load', restoreScroll);
+            if (document.readyState === 'complete') {
+                restoreScroll();
+            } else {
+                document.addEventListener('DOMContentLoaded', restoreScroll);
+            }
+        })();
+    </script>
     @auth
         @php
             $__posBadgeSections = auth()->user()->allowedJobsListSections();

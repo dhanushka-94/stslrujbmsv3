@@ -127,6 +127,9 @@
             if (!el) return;
             el.classList.add('is-hidden');
             el.setAttribute('aria-busy', 'false');
+            try {
+                window.dispatchEvent(new CustomEvent('app-loading-hidden'));
+            } catch (err) {}
         }, wait);
     }
 
