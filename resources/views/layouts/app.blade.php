@@ -139,14 +139,32 @@
 
     {{-- pb: clears fixed footer; bulk bars on job detail use z-30 so they sit above this footer (z-20) --}}
     <main class="min-w-0 flex-1 w-full max-w-none px-4 pb-20 pt-4 sm:px-6 sm:pb-20 sm:pt-6 lg:px-8">
-        @if(session('success'))
-            <div class="mb-4 px-4 py-2 rounded bg-green-100 dark:bg-green-900/30 text-green-800 dark:text-green-200">{{ session('success') }}</div>
-        @endif
-        @if(session('error'))
-            <div class="mb-4 px-4 py-2 rounded bg-red-100 dark:bg-red-900/30 text-red-800 dark:text-red-200">{{ session('error') }}</div>
-        @endif
         @yield('content')
     </main>
+
+    @if(session('success') || session('error') || session('info'))
+        <div id="app-flash-toast" class="pointer-events-none fixed inset-x-0 top-16 z-[60] flex justify-center px-4 sm:top-20" role="status" aria-live="polite">
+            <div class="pointer-events-auto max-w-lg rounded-lg px-4 py-2.5 text-sm shadow-lg ring-1
+                @if(session('error')) bg-red-50 text-red-900 ring-red-200 dark:bg-red-950/90 dark:text-red-100 dark:ring-red-800
+                @elseif(session('info')) bg-sky-50 text-sky-900 ring-sky-200 dark:bg-sky-950/90 dark:text-sky-100 dark:ring-sky-800
+                @else bg-green-50 text-green-900 ring-green-200 dark:bg-green-950/90 dark:text-green-100 dark:ring-green-800
+                @endif">
+                {{ session('error') ?? session('info') ?? session('success') }}
+            </div>
+        </div>
+        <script>
+            (function () {
+                var toast = document.getElementById('app-flash-toast');
+                if (!toast) return;
+                setTimeout(function () {
+                    toast.style.transition = 'opacity 0.35s ease, transform 0.35s ease';
+                    toast.style.opacity = '0';
+                    toast.style.transform = 'translateY(-0.5rem)';
+                    setTimeout(function () { toast.remove(); }, 400);
+                }, 3500);
+            })();
+        </script>
+    @endif
 
     <footer class="fixed bottom-0 left-0 right-0 z-20 border-t border-slate-200/90 bg-[var(--color-studio-bg-card)]/92 py-2.5 shadow-[0_-6px_24px_-8px_rgba(15,23,42,0.1)] backdrop-blur-md dark:border-slate-700/80 dark:bg-[var(--color-studio-dark-card)]/92 dark:shadow-[0_-8px_28px_-10px_rgba(0,0,0,0.35)] pb-[max(0.625rem,env(safe-area-inset-bottom))]">
         <div class="mx-auto flex w-full max-w-none flex-col items-center justify-center gap-1 px-4 text-center sm:flex-row sm:gap-2 sm:px-6 lg:px-8">

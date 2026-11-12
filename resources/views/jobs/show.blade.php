@@ -759,7 +759,7 @@
                         }
                     @endphp
                     @php $lineTokens = \App\Support\CategoryAppearance::tokensForJobEdit($edit); @endphp
-                    <tr @class([$lineTokens['row'], 'transition-colors hover:brightness-[0.99] dark:hover:brightness-110'])>
+                    <tr id="job-edit-{{ $edit->id }}" @class([$lineTokens['row'], 'transition-colors hover:brightness-[0.99] dark:hover:brightness-110'])>
                         @if($showBulkJobItemsBar)
                         <td class="px-1 py-2.5 align-middle text-center">
                             <input type="checkbox" name="edit_ids[]" value="{{ $edit->id }}" form="job-edits-bulk-form" class="job-bulk-row-cb h-4 w-4 rounded border-slate-300 text-[var(--color-studio-primary)] focus:ring-[var(--color-studio-primary)] dark:border-slate-600 dark:bg-slate-800">
@@ -1427,3 +1427,68 @@
     @endif
     </div>
 @endsection
+
+@push('scripts')
+<script>
+(function () {
+    var storageKey = 'jobShowScroll:{{ $job->id }}';
+
+    function saveScroll(fromEl) {
+        var payload = { y: window.scrollY || window.pageYOffset || 0, editId: null };
+        var node = fromEl;
+        while (node && node !== document.body) {
+            if (node.id && String(node.id).indexOf('job-edit-') === 0) {
+                payload.editId = String(node.id).replace('job-edit-', '');
+                break;
+            }
+            node = node.parentElement;
+        }
+        try { sessionStorage.setItem(storageKey, JSON.stringify(payload)); } catch (e) {}
+    }
+
+    function restoreScroll() {
+        var raw = null;
+        try { raw = sessionStorage.getItem(storageKey); } catch (e) {}
+        if (!raw) return;
+        try { sessionStorage.removeItem(storageKey); } catch (e) {}
+        var data = null;
+        try { data = JSON.parse(raw); } catch (e) { return; }
+        if (!data) return;
+
+        var apply = function () {
+            if (data.editId) {
+                var row = document.getElementById('job-edit-' + data.editId);
+                if (row) {
+                    row.scrollIntoView({ block: 'center', inline: 'nearest' });
+                    return;
+                }
+            }
+            if (typeof data.y === 'number') {
+                window.scrollTo(0, data.y);
+            }
+        };
+
+        // Wait a tick so layout/images settle, then restore place.
+        requestAnimationFrame(function () {
+            requestAnimationFrame(apply);
+        });
+        setTimeout(apply, 50);
+        setTimeout(apply, 200);
+    }
+
+    document.addEventListener('submit', function (e) {
+        var form = e.target;
+        if (!form || form.tagName !== 'FORM') return;
+        // Keep place for normal job actions (not logout).
+        if (form.getAttribute('action') && form.getAttribute('action').indexOf('logout') !== -1) return;
+        saveScroll(form);
+    }, true);
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', restoreScroll);
+    } else {
+        restoreScroll();
+    }
+})();
+</script>
+@endpush
